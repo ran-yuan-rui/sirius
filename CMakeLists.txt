@@ -66,6 +66,24 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 
+# Optional: RDMA libraries for S3-over-RDMA datasource (cuObjClient)
+pkg_check_modules(LIBIBVERBS IMPORTED_TARGET libibverbs)
+pkg_check_modules(LIBRDMACM IMPORTED_TARGET librdmacm)
+find_path(CUOBJCLIENT_INCLUDE_DIR cuobjclient.h
+  HINTS ${CUDAToolkit_INCLUDE_DIRS}
+        /usr/local/cuda/targets/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/include)
+find_library(CUOBJCLIENT_LIBRARY cuobjclient
+  HINTS ${CUDAToolkit_LIBRARY_DIR}
+        /usr/local/cuda/targets/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/lib)
+find_package(CURL CONFIG QUIET)
+if(CUOBJCLIENT_LIBRARY AND CUOBJCLIENT_INCLUDE_DIR AND LIBIBVERBS_FOUND AND LIBRDMACM_FOUND AND CURL_FOUND)
+  set(SIRIUS_RDMA_SUPPORT ON)
+  message(STATUS "RDMA S3 support: ON (cuObjClient + libcurl + libibverbs + librdmacm)")
+else()
+  set(SIRIUS_RDMA_SUPPORT OFF)
+  message(STATUS "RDMA S3 support: OFF (missing dependencies)")
+endif()
+
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
 # in the vcpkg installed lib dir, which isn't on the default linker search path.
@@ -140,6 +158,8 @@ set(EXTENSION_SOURCES
     src/op/scan/datasource_factory.cpp
     src/op/scan/s3_datasource.cpp
     src/op/scan/gds_datasource.cpp
+    src/op/scan/s3_sigv4.cpp
+    src/op/scan/rdma_s3_datasource.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
@@ -287,6 +307,14 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
                         cuCascade::cucascade)
+
+  # RDMA S3 support (cuObjClient + libcurl + RDMA verbs)
+  if(SIRIUS_RDMA_SUPPORT)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_RDMA_SUPPORT)
+    target_include_directories(${_target} PRIVATE ${CUOBJCLIENT_INCLUDE_DIR})
+    target_link_libraries(${_target} ${CUOBJCLIENT_LIBRARY} CURL::libcurl
+                          PkgConfig::LIBIBVERBS PkgConfig::LIBRDMACM)
+  endif()
 
   add_dependencies(${_target} duckdb_static)
 endforeach()

@@ -414,9 +414,9 @@ Build, `sirius_unittest "[datasource]"`, `sirius_unittest "[parquet_scan_task]"`
 
 ---
 
-## PR 7: RDMA S3 Datasource (cuObjClient)
+## PR 7: RDMA S3 Datasource (cuObjClient) -- DONE
 
-**Goal:** Enable GPU Direct RDMA for S3-compatible stores (VAST, MinIO) using NVIDIA's cuObjClient library for the RDMA data plane and libcurl + SigV4 for the HTTP control plane.
+**Status:** Committed. Build requires RDMA libs + cuObjClient + libcurl; gracefully disabled without them.
 
 ### Build system changes (colocated)
 

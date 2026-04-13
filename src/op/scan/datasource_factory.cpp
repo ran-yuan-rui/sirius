@@ -17,6 +17,9 @@
 #include <op/scan/datasource_factory.hpp>
 #include <op/scan/gds_datasource.hpp>
 #include <op/scan/s3_datasource.hpp>
+#ifdef SIRIUS_RDMA_SUPPORT
+#include <op/scan/rdma_s3_datasource.hpp>
+#endif
 
 #include <cudf/io/datasource.hpp>
 
@@ -58,6 +61,11 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(std::string con
   if (uri.empty()) { throw std::runtime_error("datasource_factory::create: empty URI"); }
 
   if (is_s3_uri(uri)) {
+#ifdef SIRIUS_RDMA_SUPPORT
+    if (config.transport == s3_transport::RDMA) {
+      return std::make_unique<rdma_s3_datasource>(uri, config);
+    }
+#endif
     return std::make_unique<s3_datasource>(uri, config);
   }
 
