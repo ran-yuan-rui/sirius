@@ -36,34 +36,11 @@ vcpkg_from_github(
   HEAD_REF
   master)
 
-# Patch kvikio to not require cuFile Batch/Stream API (may not be available in
-# the CUDA toolkit). KvikIO still works without cuFile, just disables GPUDirect
-# Storage (GDS).
-vcpkg_replace_string(
-  "${SOURCE_PATH}/cpp/CMakeLists.txt" "if(NOT TARGET CUDA::cuFile)"
-  "if(TRUE) # Disable cuFile/GDS - batch/stream API requires newer cuFile SDK")
-
-# Add stub declarations for cuFile batch/stream API functions so the shim
-# compiles without cufile.h. These are never called - they only provide type
-# info for decltype().
-vcpkg_replace_string(
-  "${SOURCE_PATH}/cpp/include/kvikio/shim/cufile_h_wrapper.hpp"
-  "CUfileError_t cuFileDriverSetMaxPinnedMemSize(...);"
-  "CUfileError_t cuFileDriverSetMaxPinnedMemSize(...);
-using CUfileBatchHandle_t = void*;
-enum CUfileOpcode_t { CUFILE_READ = 0, CUFILE_WRITE = 1 };
-enum CUfileBatchMode_t { CUFILE_BATCH = 0 };
-struct CUfileIOEvents_t { int dummy; };
-struct CUfileIOParams_t { CUfileBatchMode_t mode; union { struct { void* devPtr_base; off_t file_offset; off_t devPtr_offset; size_t size; } batch; } u; CUfileHandle_t fh; CUfileOpcode_t opcode; void* cookie; };
-CUfileError_t cuFileBatchIOSetUp(...);
-CUfileError_t cuFileBatchIOSubmit(...);
-CUfileError_t cuFileBatchIOGetStatus(...);
-CUfileError_t cuFileBatchIOCancel(...);
-CUfileError_t cuFileBatchIODestroy(...);
-CUfileError_t cuFileReadAsync(...);
-CUfileError_t cuFileWriteAsync(...);
-CUfileError_t cuFileStreamRegister(...);
-CUfileError_t cuFileStreamDeregister(...);")
+# NOTE: The cuFile Batch/Stream API patch was removed to enable GPU Direct
+# Storage (GDS). The current CUDA toolkit (13.1+) includes cuFile 1.16+
+# which provides all required APIs. KvikIO's try_compile() checks will pass.
+# If building on CUDA < 12.2, re-add the patch or downgrade the FATAL_ERROR
+# to WARNING in KvikIO's CMakeLists.txt.
 
 vcpkg_cmake_configure(
   SOURCE_PATH

@@ -15,9 +15,12 @@
  */
 
 #include <op/scan/datasource_factory.hpp>
+#include <op/scan/gds_datasource.hpp>
 #include <op/scan/s3_datasource.hpp>
 
 #include <cudf/io/datasource.hpp>
+
+#include <kvikio/shim/cufile.hpp>
 
 #include <stdexcept>
 #include <string>
@@ -31,8 +34,7 @@ bool datasource_factory::is_s3_uri(std::string const& uri)
 
 bool datasource_factory::is_gds_preferred([[maybe_unused]] std::string const& path)
 {
-  // GDS support will be added in PR 4 (gds_datasource).
-  return false;
+  return kvikio::is_cufile_available();
 }
 
 namespace {
@@ -61,6 +63,7 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(std::string con
 
   // Local file path (with optional file:// prefix).
   auto const path = strip_file_scheme(uri);
+  if (is_gds_preferred(path)) { return std::make_unique<gds_datasource>(path); }
   return cudf::io::datasource::create(path);
 }
 
@@ -75,6 +78,7 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(std::string con
   }
 
   auto const local_path = strip_file_scheme(path);
+  if (is_gds_preferred(local_path)) { return std::make_unique<gds_datasource>(local_path); }
   return cudf::io::datasource::create(local_path);
 }
 

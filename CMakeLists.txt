@@ -138,6 +138,7 @@ set(EXTENSION_SOURCES
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/datasource_factory.cpp
     src/op/scan/s3_datasource.cpp
+    src/op/scan/gds_datasource.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
@@ -395,6 +396,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_metadata_gpu_scan_operators.cpp
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_datasource_factory.cpp
+    test/cpp/scan/test_gds_datasource.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp

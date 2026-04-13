@@ -317,9 +317,9 @@ Clean rebuild (vcpkg portfile changed). `sirius_unittest "[datasource]"`, full r
 
 ---
 
-## PR 4: GDS Datasource (KvikIO FileHandle)
+## PR 4: GDS Datasource (KvikIO FileHandle) -- DONE
 
-**Goal:** Enable GPU Direct Storage for local NVMe files. Includes build system change to remove cuFile patch.
+**Status:** Committed. Build requires incremental build (network blocked for clean build).
 
 ### Build system change (colocated)
 
