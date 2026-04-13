@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "exec/config.hpp"
 #include "op/scan/config.hpp"
+#include "op/scan/object_store_config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -107,6 +108,16 @@ struct sirius_config {
 
   [[nodiscard]] operator_params& get_operator_params() noexcept { return _operator_params; }
 
+  [[nodiscard]] const op::scan::object_store_config& get_object_store_config() const noexcept
+  {
+    return _object_store_config;
+  }
+
+  [[nodiscard]] op::scan::object_store_config& get_object_store_config() noexcept
+  {
+    return _object_store_config;
+  }
+
  private:
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
@@ -117,6 +128,7 @@ struct sirius_config {
   exec::downgrade_executor_config _downgrade_executor_config;
   op::scan::scan_executor_config _scan_executor_config;
   operator_params _operator_params;
+  op::scan::object_store_config _object_store_config;
 };
 
 }  // namespace sirius

@@ -59,6 +59,7 @@ endif()
 
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
+find_package(CUDAToolkit REQUIRED)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
@@ -136,6 +137,7 @@ set(EXTENSION_SOURCES
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/prefetched_data_source.cpp
     src/op/scan/datasource_factory.cpp
+    src/op/scan/s3_datasource.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_parquet_metadata_scan_operator.cpp
     src/op/scan/sirius_gpu_parquet_scan_operator.cpp
@@ -269,6 +271,13 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
+  # The CUDAToolkit_INCLUDE_DIRS path is needed when directly including KvikIO
+  # headers (e.g., kvikio/remote_handle.hpp) because KvikIO's cufile_h_wrapper
+  # includes <cufile.h> which lives in the CUDA toolkit include directory.
+  if(DEFINED CUDAToolkit_INCLUDE_DIRS)
+    target_include_directories(${_target} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  endif()
+
   if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
     target_compile_definitions(${_target}
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
@@ -343,6 +352,7 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/config/test_object_store_config.cpp
     test/cpp/data/test_host_parquet_representation.cpp
     test/cpp/debug/test_debug_utils.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp

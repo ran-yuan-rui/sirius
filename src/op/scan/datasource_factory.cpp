@@ -15,6 +15,7 @@
  */
 
 #include <op/scan/datasource_factory.hpp>
+#include <op/scan/s3_datasource.hpp>
 
 #include <cudf/io/datasource.hpp>
 
@@ -55,9 +56,7 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(std::string con
   if (uri.empty()) { throw std::runtime_error("datasource_factory::create: empty URI"); }
 
   if (is_s3_uri(uri)) {
-    // S3 support will be added in PR 3 (s3_datasource).
-    throw std::runtime_error(
-      "datasource_factory::create: S3 URIs are not yet supported. URI: " + uri);
+    return std::make_unique<s3_datasource>(uri, config);
   }
 
   // Local file path (with optional file:// prefix).

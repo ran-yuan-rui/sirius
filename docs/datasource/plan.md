@@ -267,9 +267,9 @@ Build, `sirius_unittest "[datasource]"`, full regression. All existing `[parquet
 
 ---
 
-## PR 3: S3 Datasource (KvikIO RemoteHandle)
+## PR 3: S3 Datasource (KvikIO RemoteHandle) -- IN PROGRESS
 
-**Goal:** Enable `s3://` queries via GPU-accelerated scan pipeline. Includes build system change for KvikIO remote, config infrastructure, and the S3 datasource implementation.
+**Status:** Code complete. Build blocked by network issue (Catch2 FetchContent git clone fails through proxy after `rm -rf build`). See [pr3-build-note.md](pr3-build-note.md). Needs incremental build from existing build dir to verify.
 
 ### Build system changes (colocated)
 

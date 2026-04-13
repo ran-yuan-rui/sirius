@@ -112,6 +112,21 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, op::scan::object_store_config& opt)
+{
+  yaml::reader r(node, "object_store");
+  r.optional("endpoint", opt.endpoint);
+  r.optional("region", opt.region);
+  r.optional("access_key_id", opt.access_key_id);
+  r.optional("secret_access_key", opt.secret_access_key);
+  r.optional("session_token", opt.session_token);
+  r.optional("transport", opt.transport);
+  r.optional("use_tls", opt.use_tls);
+  r.optional("connection_timeout_ms", opt.connection_timeout_ms);
+  r.optional("request_timeout_ms", opt.request_timeout_ms);
+  r.reject_unknown();
+}
+
 namespace {
 
 struct topology {
@@ -331,6 +346,11 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
     // Operator params
     if (auto n = r.optional_node("operator_params")) { sirius::from_yaml(*n, _operator_params); }
+
+    // Object store config
+    if (auto n = r.optional_node("object_store")) {
+      sirius::from_yaml(*n, _object_store_config);
+    }
 
     // Explicit space configs (low-level API)
     std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;

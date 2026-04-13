@@ -18,6 +18,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
+#include "op/scan/object_store_config.hpp"
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -801,6 +802,57 @@ static sirius::operator_params* get_operator_params(ClientContext& context)
   return &sirius_ctx->get_config().get_operator_params();
 }
 
+static sirius::op::scan::object_store_config* get_object_store_config(ClientContext& context)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; object_store SET ignored");
+    return nullptr;
+  }
+  return &sirius_ctx->get_config().get_object_store_config();
+}
+
+static void SetS3Endpoint(ClientContext& context, SetScope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  cfg->endpoint = StringValue::Get(parameter);
+}
+
+static void SetS3Region(ClientContext& context, SetScope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  cfg->region = StringValue::Get(parameter);
+}
+
+static void SetS3AccessKeyId(ClientContext& context, SetScope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  cfg->access_key_id = StringValue::Get(parameter);
+}
+
+static void SetS3SecretAccessKey(ClientContext& context, SetScope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  cfg->secret_access_key = StringValue::Get(parameter);
+}
+
+static void SetS3Transport(ClientContext& context, SetScope, Value& parameter)
+{
+  auto* cfg = get_object_store_config(context);
+  if (!cfg) { return; }
+  auto val = StringValue::Get(parameter);
+  sirius::op::scan::s3_transport t;
+  if (!sirius::op::scan::string_to_enum(val, t)) {
+    throw InvalidInputException(
+      "Invalid s3_transport '{}'. Valid values: auto, http, rdma", val);
+  }
+  cfg->transport = t;
+}
+
 static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -1019,6 +1071,24 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
+
+  // S3 / object store configuration
+  config.AddExtensionOption(
+    "s3_endpoint", "S3 endpoint URL", LogicalType::VARCHAR, Value(""), SetS3Endpoint);
+  config.AddExtensionOption(
+    "s3_region", "AWS region", LogicalType::VARCHAR, Value(""), SetS3Region);
+  config.AddExtensionOption(
+    "s3_access_key_id", "AWS access key ID", LogicalType::VARCHAR, Value(""), SetS3AccessKeyId);
+  config.AddExtensionOption("s3_secret_access_key",
+                            "AWS secret access key",
+                            LogicalType::VARCHAR,
+                            Value(""),
+                            SetS3SecretAccessKey);
+  config.AddExtensionOption("s3_transport",
+                            "S3 transport mode: auto, http, rdma",
+                            LogicalType::VARCHAR,
+                            Value("auto"),
+                            SetS3Transport);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

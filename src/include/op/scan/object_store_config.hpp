@@ -18,6 +18,8 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 
 namespace sirius::op::scan {
 
@@ -29,6 +31,32 @@ enum class s3_transport {
   HTTP,  ///< Force HTTP Range GET (works with any S3-compatible endpoint).
   RDMA,  ///< Force RDMA data path (requires cuObjClient + cuObjServer on storage).
 };
+
+inline bool string_to_enum(std::string_view sv, s3_transport& t)
+{
+  static const std::unordered_map<std::string_view, s3_transport> map = {
+    {"auto", s3_transport::AUTO},
+    {"http", s3_transport::HTTP},
+    {"https", s3_transport::HTTP},
+    {"rdma", s3_transport::RDMA},
+  };
+  auto it = map.find(sv);
+  if (it != map.end()) {
+    t = it->second;
+    return true;
+  }
+  return false;
+}
+
+inline bool enum_to_string(s3_transport t, std::string& s)
+{
+  switch (t) {
+    case s3_transport::AUTO: s = "auto"; return true;
+    case s3_transport::HTTP: s = "http"; return true;
+    case s3_transport::RDMA: s = "rdma"; return true;
+  }
+  return false;
+}
 
 /**
  * @brief Configuration for S3-compatible object store access.
