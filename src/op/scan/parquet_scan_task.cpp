@@ -17,6 +17,7 @@
 // sirius
 #include <data/cached_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/gpu_parquet_representation.hpp>
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -532,41 +533,91 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     byte_ranges.end(), merged_column_chunk_ranges.begin(), merged_column_chunk_ranges.end());
   byte_ranges.emplace_back(footer_off, footer_size);  // footer + trailer
 
-  // Read each byte range into the allocation asynchronously
-  int64_t bytes_read = 0;
-  std::vector<std::future<std::size_t>> read_futures;
+  // Compute total bytes for all ranges
+  int64_t total_bytes = 0;
   for (auto const& range : byte_ranges) {
-    read_range_into_allocation(
-      range.offset(), range.size(), data_accessor, allocation, read_futures);
-    bytes_read += range.size();
+    total_bytes += range.size();
   }
-  std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
 
-  if (bytes_read != l_state.get_reserved_compressed_bytes()) {
+  if (total_bytes != l_state.get_reserved_compressed_bytes()) {
     throw std::runtime_error(
-      "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
+      "[parquet_scan_task] Error in reading byte ranges: total bytes does not match reserved "
       "compressed bytes");
   }
 
-  // Create a data batch with the column chunks
-  auto parquet_representation =
-    std::make_unique<host_parquet_representation>(l_state.get_memory_space(),
-                                                  std::move(allocation),
-                                                  std::move(reader),
-                                                  g_state.get_options(),
-                                                  std::move(l_state.get_rg_indices()),
-                                                  std::move(byte_ranges),
-                                                  l_state.get_reserved_compressed_bytes(),
-                                                  l_state.get_reserved_uncompressed_bytes(),
-                                                  file_size,
-                                                  _datasource,
-                                                  g_state.get_filter_expression(),
-                                                  g_state.get_post_filter_projection_ids());
+  // --- GPU Direct path ---
+  // When the datasource supports device reads (GDS, RDMA), read compressed bytes
+  // directly into GPU memory and create a gpu_parquet_representation.
+  bool const use_gpu_direct =
+    _datasource->supports_device_read() &&
+    _datasource->is_device_read_preferred(static_cast<size_t>(total_bytes));
 
-  // Propagate the post-convert hook and data-file path (non-null only for iceberg V2 scans).
-  if (g_state.has_post_convert_fn()) {
-    parquet_representation->set_post_convert_fn(g_state.get_post_convert_fn());
-    parquet_representation->set_data_file_path(g_state.get_file_path(l_state.get_file_idx()));
+  std::unique_ptr<cucascade::idata_representation> parquet_representation;
+
+  if (use_gpu_direct && _gpu_memory_space != nullptr) {
+    // Allocate a single contiguous GPU buffer for all byte ranges
+    rmm::device_buffer gpu_buf(static_cast<size_t>(total_bytes), stream);
+
+    // Read each byte range directly into GPU memory
+    std::vector<std::future<std::size_t>> read_futures;
+    size_t gpu_offset = 0;
+    for (auto const& range : byte_ranges) {
+      auto* dst = static_cast<uint8_t*>(gpu_buf.data()) + gpu_offset;
+      read_futures.push_back(
+        _datasource->device_read_async(range.offset(), range.size(), dst, stream));
+      gpu_offset += range.size();
+    }
+    std::for_each(read_futures.begin(), read_futures.end(), [](auto& f) { f.get(); });
+
+    auto gpu_repr = std::make_unique<gpu_parquet_representation>(
+      *_gpu_memory_space,
+      std::move(gpu_buf),
+      std::move(reader),
+      g_state.get_options(),
+      std::move(l_state.get_rg_indices()),
+      std::move(byte_ranges),
+      l_state.get_reserved_compressed_bytes(),
+      l_state.get_reserved_uncompressed_bytes(),
+      file_size,
+      _datasource,
+      g_state.get_filter_expression(),
+      g_state.get_post_filter_projection_ids());
+
+    if (g_state.has_post_convert_fn()) {
+      gpu_repr->set_post_convert_fn(g_state.get_post_convert_fn());
+      gpu_repr->set_data_file_path(g_state.get_file_path(l_state.get_file_idx()));
+    }
+    parquet_representation = std::move(gpu_repr);
+
+  } else {
+    // --- Existing host path ---
+    // Read byte ranges into host memory and create host_parquet_representation.
+    std::vector<std::future<std::size_t>> read_futures;
+    for (auto const& range : byte_ranges) {
+      read_range_into_allocation(
+        range.offset(), range.size(), data_accessor, allocation, read_futures);
+    }
+    std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
+
+    auto host_repr = std::make_unique<host_parquet_representation>(
+      l_state.get_memory_space(),
+      std::move(allocation),
+      std::move(reader),
+      g_state.get_options(),
+      std::move(l_state.get_rg_indices()),
+      std::move(byte_ranges),
+      l_state.get_reserved_compressed_bytes(),
+      l_state.get_reserved_uncompressed_bytes(),
+      file_size,
+      _datasource,
+      g_state.get_filter_expression(),
+      g_state.get_post_filter_projection_ids());
+
+    if (g_state.has_post_convert_fn()) {
+      host_repr->set_post_convert_fn(g_state.get_post_convert_fn());
+      host_repr->set_data_file_path(g_state.get_file_path(l_state.get_file_idx()));
+    }
+    parquet_representation = std::move(host_repr);
   }
 
   std::shared_ptr<cucascade::data_batch> batch;
@@ -585,11 +636,19 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     } else {
       batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(host_table));
     }
+  } else if (use_gpu_direct) {
+    // GPU Direct path: parquet_representation is gpu_parquet_representation.
+    // No host caching — data is already in GPU memory.
+    batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(),
+                                                    std::move(parquet_representation));
   } else {
     if (_wrap_in_cache) {
+      // parquet_representation is host_parquet_representation here.
+      auto host_repr = std::unique_ptr<host_parquet_representation>(
+        static_cast<host_parquet_representation*>(parquet_representation.release()));
       batch = std::make_shared<cucascade::data_batch>(
         get_next_batch_id(),
-        std::make_unique<cached_host_parquet_representation>(std::move(parquet_representation)));
+        std::make_unique<cached_host_parquet_representation>(std::move(host_repr)));
     } else {
       batch = std::make_shared<cucascade::data_batch>(get_next_batch_id(),
                                                       std::move(parquet_representation));

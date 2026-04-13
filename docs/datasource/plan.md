@@ -383,9 +383,9 @@ Build, `sirius_unittest "[datasource]"`, full regression.
 
 ---
 
-## PR 6: Scan Task GPU Direct Branching
+## PR 6: Scan Task GPU Direct Branching -- DONE
 
-**Goal:** Wire the GDS datasource + `gpu_parquet_representation` end-to-end by branching in `parquet_scan_task::compute_task()`.
+**Status:** Committed.
 
 ### Changes
 
