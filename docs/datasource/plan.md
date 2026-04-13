@@ -30,9 +30,9 @@ Before implementing each PR, use the project's Claude Code skills:
 
 ---
 
-## PR 1: Interface Definitions (Review Scope)
+## PR 1: Interface Definitions (Review Scope) -- DONE
 
-**Goal:** Header-only PR that defines every new public interface. No implementations, no build system changes, no behavioral changes. Reviewers see the full change surface in one diff.
+**Status:** Committed as `2951d4a`
 
 ### New header files
 
@@ -237,9 +237,9 @@ Build unchanged — headers are not included by any existing code. Regression pa
 
 ---
 
-## PR 2: Datasource Factory + Local File Path
+## PR 2: Datasource Factory + Local File Path -- DONE
 
-**Goal:** Introduce the factory, replace 3 call sites, with zero behavior change. Local paths delegate to `cudf::io::datasource::create()`. S3 URIs throw (not yet implemented).
+**Status:** Committed. Build passes.
 
 ### Changes
 

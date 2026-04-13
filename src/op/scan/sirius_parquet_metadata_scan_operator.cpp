@@ -16,6 +16,7 @@
 
 // sirius
 #include <log/logging.hpp>
+#include <op/scan/datasource_factory.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/parquet_scan_task.hpp>  // detail::make_selected_column_indices, detail::projected_columns_are_flat
 #include <op/scan/scan_utils.hpp>
@@ -248,7 +249,7 @@ std::unique_ptr<operator_data> sirius_parquet_metadata_scan_operator::execute(
   std::size_t file_idx = 0;
   for (auto const& file_path : input.file_paths) {
     //===----------Read metadata footers----------===//
-    result->datasources.push_back(cudf::io::datasource::create(file_path));
+    result->datasources.push_back(datasource_factory::create(file_path));
 
     std::unique_ptr<cudf::io::datasource::buffer> footer_buffer;
 #if CUDF_VERSION_NUM >= 2604
