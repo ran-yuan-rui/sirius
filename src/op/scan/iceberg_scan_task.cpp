@@ -28,6 +28,7 @@
 
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <log/logging.hpp>
+#include <op/scan/datasource_factory.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/iceberg_scan_task.hpp>
 
@@ -53,8 +54,9 @@ void read_positional_delete_file(std::string const& delete_file_path,
 {
   auto stream = cudf::get_default_stream();
 
+  auto ds = datasource_factory::create(delete_file_path);
   auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{delete_file_path}).build();
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{ds.get()}).build();
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl || result.tbl->num_rows() == 0) { return; }
@@ -116,8 +118,9 @@ std::pair<std::unique_ptr<cudf::table>, std::vector<std::string>> read_equality_
   std::string const& delete_file_path)
 {
   auto stream = cudf::get_default_stream();
+  auto ds = datasource_factory::create(delete_file_path);
   auto opts =
-    cudf::io::parquet_reader_options::builder(cudf::io::source_info{delete_file_path}).build();
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{ds.get()}).build();
   auto result = cudf::io::read_parquet(opts, stream);
 
   if (!result.tbl) {

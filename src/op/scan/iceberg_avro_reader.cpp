@@ -25,12 +25,11 @@
  * array, map, record).  Any other Avro feature (enum, fixed, …) will throw.
  */
 
+#include <op/scan/datasource_factory.hpp>
 #include <op/scan/iceberg_avro_reader.hpp>
 
 #include <array>
 #include <cstring>
-#include <fstream>
-#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -548,10 +547,11 @@ static void advance_to_field(int field_idx,
 
 std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::string& path)
 {
-  // Load the entire file into memory (manifest lists are typically < 1 MB)
-  std::ifstream f(path, std::ios::binary);
-  if (!f) { throw std::runtime_error("avro: cannot open manifest list: " + path); }
-  std::vector<uint8_t> buf(std::istreambuf_iterator<char>(f), {});
+  // Load the entire file into memory via datasource_factory (works for local and S3 paths).
+  auto ds = datasource_factory::create(path);
+  auto file_size = ds->size();
+  std::vector<uint8_t> buf(file_size);
+  ds->host_read(0, file_size, buf.data());
 
   const uint8_t* p   = buf.data();
   const uint8_t* end = buf.data() + buf.size();
@@ -628,9 +628,11 @@ std::vector<std::pair<std::string, int>> read_iceberg_manifest_list(const std::s
 std::vector<std::string> read_iceberg_manifest_delete_files(const std::string& path,
                                                             int target_content)
 {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) { throw std::runtime_error("avro: cannot open manifest: " + path); }
-  std::vector<uint8_t> buf(std::istreambuf_iterator<char>(f), {});
+  // Load the entire file into memory via datasource_factory (works for local and S3 paths).
+  auto ds = datasource_factory::create(path);
+  auto file_size = ds->size();
+  std::vector<uint8_t> buf(file_size);
+  ds->host_read(0, file_size, buf.data());
 
   const uint8_t* p   = buf.data();
   const uint8_t* end = buf.data() + buf.size();

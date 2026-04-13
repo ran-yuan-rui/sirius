@@ -500,9 +500,9 @@ Build with and without RDMA libs + cuObjClient. `sirius_unittest "[datasource]"`
 
 ---
 
-## PR 8: Iceberg S3 Support
+## PR 8: Iceberg S3 Support -- DONE
 
-**Goal:** Fix the 5 direct-I/O sites in the Iceberg pipeline so Iceberg-over-S3 works end-to-end, including V2 deletes and manifest resolution.
+**Status:** Committed.
 
 ### Scope Assessment
 
