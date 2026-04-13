@@ -550,7 +550,9 @@ Build, `sirius_unittest "[datasource]"`, `sirius_unittest "[integration]"`, full
 
 ---
 
-## PR 9: Documentation
+## PR 9: Documentation -- DONE
+
+**Status:** Committed.
 
 **Modified files:**
 - `docs/super-sirius/scan.md` — add "Storage Backends" section describing the datasource factory and supported backends.

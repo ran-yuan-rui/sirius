@@ -138,8 +138,17 @@ The active execution engine. Uses `namespace sirius`, entry point: `CALL gpu_exe
 - Expression evaluation: `src/expression_executor/`
 - Runtime configuration: `src/config.cpp` / `src/include/config.hpp`
 - CUDA kernels: `src/cuda/` (cuDF wrappers, expression dispatch)
+- Datasource layer: `src/op/scan/datasource_factory.cpp` (URI-based dispatch to local/S3/GDS/RDMA backends)
 
 > **Note:** A legacy code path (`gpu_processing`, `namespace duckdb`) still exists in `src/operator/`, `src/plan/`, `src/gpu_executor.cpp` etc. All new development targets Super Sirius.
+
+### Datasource Layer
+
+The datasource factory (`datasource_factory::create()`) replaces all direct `cudf::io::datasource::create()` calls. It dispatches based on URI scheme and config:
+- Local paths / `file://` → `cudf::io::datasource` (or `gds_datasource` if GDS available)
+- `s3://` → `s3_datasource` (KvikIO RemoteHandle) or `rdma_s3_datasource` (cuObjClient + RDMA)
+
+Design docs: `docs/datasource/` (proposal, gap analysis, implementation plan).
 
 ### Super Sirius Documentation
 
@@ -203,6 +212,7 @@ The fallback mechanism is implemented in `src/fallback.cpp` and integrates with 
 - Separable compilation enabled for CUDA (`CMAKE_CUDA_SEPARABLE_COMPILATION ON`)
 - GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
 - Links against: cudf::cudf, rmm::rmm, libnuma, yaml-cpp, absl::any_invocable, spdlog, cuCascade
+- Optional RDMA S3: cuObjClient, libcurl, libibverbs, librdmacm (auto-detected; `SIRIUS_RDMA_SUPPORT` defined when present)
 
 ## Extension Development
 

@@ -57,7 +57,7 @@ iceberg_metadata_reader::read_iceberg_delete_metadata()
 
 ### Impact
 
-Iceberg-over-S3 will work for the **data file** scan path (covered by Phase 1 of the proposal) but will fail for any Iceberg table with V2 deletes or when resolving manifests. This should be explicitly flagged as a user-facing limitation or tracked as a follow-up phase.
+Iceberg-over-S3 is fully supported after PR 8. All 5 direct-I/O sites now go through the datasource factory.
 
 ---
 
