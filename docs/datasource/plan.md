@@ -352,9 +352,9 @@ Clean rebuild (portfile changed). `sirius_unittest "[datasource]"`, full regress
 
 ---
 
-## PR 5: GPU Parquet Representation + Converter
+## PR 5: GPU Parquet Representation + Converter -- DONE
 
-**Goal:** Add the new data type for compressed Parquet bytes in GPU memory and the converter to decompress them in-place on GPU.
+**Status:** Committed.
 
 ### Implementation
 

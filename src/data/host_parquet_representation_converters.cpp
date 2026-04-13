@@ -16,6 +16,7 @@
 
 // sirius
 #include <data/cached_data_representation.hpp>
+#include <data/gpu_parquet_representation.hpp>
 #include <data/host_parquet_representation.hpp>
 #include <data/host_parquet_representation_converters.hpp>
 #include <op/scan/cached_ranges.hpp>
@@ -187,12 +188,154 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
 
 }  // namespace detail
 
+// ---------------------------------------------------------------------------
+// gpu_parquet_representation -> gpu_table_representation converter
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/**
+ * @brief A cudf::io::datasource that serves reads from a GPU-resident device buffer.
+ *
+ * Used by the gpu_parquet -> gpu_table converter to feed the already-GPU-resident
+ * compressed Parquet bytes to cudf::io::read_parquet() for in-place decompression.
+ */
+class device_buffer_datasource : public cudf::io::datasource {
+ public:
+  device_buffer_datasource(void const* d_data, std::size_t size) : _d_data(d_data), _size(size) {}
+
+  [[nodiscard]] bool supports_device_read() const override { return true; }
+  [[nodiscard]] bool is_device_read_preferred(size_t) const override { return true; }
+
+  std::unique_ptr<buffer> device_read(size_t offset, size_t size,
+                                      rmm::cuda_stream_view stream) override
+  {
+    // Return a non-owning buffer pointing into the existing device memory.
+    class non_owning_device_buffer : public buffer {
+     public:
+      non_owning_device_buffer(uint8_t const* ptr, size_t sz) : _ptr(ptr), _sz(sz) {}
+      [[nodiscard]] size_t size() const override { return _sz; }
+      [[nodiscard]] uint8_t const* data() const override { return _ptr; }
+
+     private:
+      uint8_t const* _ptr;
+      size_t _sz;
+    };
+
+    auto const* ptr = static_cast<uint8_t const*>(_d_data) + offset;
+    return std::make_unique<non_owning_device_buffer>(ptr, size);
+  }
+
+  size_t device_read(size_t offset, size_t size, uint8_t* dst,
+                     rmm::cuda_stream_view stream) override
+  {
+    auto const* src = static_cast<uint8_t const*>(_d_data) + offset;
+    RMM_CUDA_TRY(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, stream.value()));
+    stream.synchronize();
+    return size;
+  }
+
+  std::future<size_t> device_read_async(size_t offset, size_t size, uint8_t* dst,
+                                        rmm::cuda_stream_view stream) override
+  {
+    auto bytes = device_read(offset, size, dst, stream);
+    std::promise<size_t> p;
+    p.set_value(bytes);
+    return p.get_future();
+  }
+
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
+  {
+    auto const* src = static_cast<uint8_t const*>(_d_data) + offset;
+    RMM_CUDA_TRY(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost));
+    return size;
+  }
+
+  std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
+  {
+    auto buf = std::make_unique<std::vector<uint8_t>>(size);
+    host_read(offset, size, buf->data());
+    class owning_buffer : public buffer {
+     public:
+      owning_buffer(std::unique_ptr<std::vector<uint8_t>> data, size_t len)
+        : _data(std::move(data)), _len(len)
+      {
+      }
+      [[nodiscard]] size_t size() const override { return _len; }
+      [[nodiscard]] uint8_t const* data() const override { return _data->data(); }
+
+     private:
+      std::unique_ptr<std::vector<uint8_t>> _data;
+      size_t _len;
+    };
+    return std::make_unique<owning_buffer>(std::move(buf), size);
+  }
+
+  [[nodiscard]] size_t size() const override { return _size; }
+
+ private:
+  void const* _d_data;
+  std::size_t _size;
+};
+
+std::unique_ptr<cucascade::idata_representation> convert_gpu_parquet_to_gpu_table(
+  cucascade::idata_representation& source,
+  cucascade::memory::memory_space const* target_memory_space,
+  rmm::cuda_stream_view stream)
+{
+  auto& gpu_src                          = source.cast<gpu_parquet_representation>();
+  auto const& post_filter_projection_ids = gpu_src.get_post_filter_projection_ids();
+
+  rmm::device_async_resource_ref mr_ref(target_memory_space->get_default_allocator());
+  rmm::cuda_device_id target_device_id(target_memory_space->get_device_id());
+  rmm::cuda_set_device_raii target_device_raii(target_device_id);
+
+  // Wrap the GPU-resident compressed bytes in a datasource.
+  auto data_source = std::make_unique<device_buffer_datasource>(gpu_src.get_column_chunks().data(),
+                                                                gpu_src.get_file_size());
+
+  auto opts = gpu_src.get_reader_options();
+  opts.set_source(cudf::io::source_info{data_source.get()});
+  opts.set_row_groups({std::vector<cudf::size_type>(gpu_src.get_row_group_indices().begin(),
+                                                    gpu_src.get_row_group_indices().end())});
+
+  auto [table, md] = cudf::io::read_parquet(opts, stream, mr_ref);
+
+  if (gpu_src.has_post_convert_fn()) {
+    table = gpu_src.apply_post_convert(std::move(table), stream);
+  }
+
+  stream.synchronize();
+
+  if (!post_filter_projection_ids.empty()) {
+    auto columns = table->release();
+    std::vector<std::unique_ptr<cudf::column>> projected_columns;
+    projected_columns.reserve(post_filter_projection_ids.size());
+    for (auto const id : post_filter_projection_ids) {
+      projected_columns.push_back(std::move(columns[id]));
+    }
+    table = std::make_unique<cudf::table>(std::move(projected_columns));
+  }
+
+  return std::make_unique<cucascade::gpu_table_representation>(
+    std::move(table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
+}
+
+}  // namespace detail
+
 void register_parquet_converters(cucascade::representation_converter_registry& registry)
 {
   // HOST Parquet -> GPU
   if (!registry.has_converter<host_parquet_representation, cucascade::gpu_table_representation>()) {
     registry.register_converter<host_parquet_representation, cucascade::gpu_table_representation>(
       detail::convert_host_parquet_to_gpu_with_prefetched_data_source);
+  }
+
+  // GPU Parquet -> GPU Table (in-place GPU decompression for GPU Direct path)
+  if (!registry
+         .has_converter<gpu_parquet_representation, cucascade::gpu_table_representation>()) {
+    registry.register_converter<gpu_parquet_representation, cucascade::gpu_table_representation>(
+      detail::convert_gpu_parquet_to_gpu_table);
   }
 
   // HOST Parquet -> HOST Parquet (cross-host copy)

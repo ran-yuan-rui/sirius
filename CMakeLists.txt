@@ -100,6 +100,7 @@ set(EXTENSION_SOURCES
     src/creator/task_creator.cpp
     src/data/host_parquet_representation.cpp
     src/data/host_parquet_representation_converters.cpp
+    src/data/gpu_parquet_representation.cpp
     src/downgrade/downgrade_executor.cpp
     src/downgrade/downgrade_task.cpp
     src/expression_executor/gpu_expression_executor.cpp
