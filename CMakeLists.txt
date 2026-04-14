@@ -59,7 +59,18 @@ endif()
 
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
-find_package(CUDAToolkit REQUIRED)
+
+# Derive CUDA toolkit include directory from the nvcc compiler path.
+# This is needed when directly including KvikIO headers (cufile_h_wrapper.hpp
+# includes <cufile.h> which lives in the CUDA toolkit include directory).
+get_filename_component(_NVCC_DIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+get_filename_component(_CUDA_ROOT "${_NVCC_DIR}" DIRECTORY)
+set(SIRIUS_CUDA_INCLUDE_DIR "${_CUDA_ROOT}/targets/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/include")
+if(NOT EXISTS "${SIRIUS_CUDA_INCLUDE_DIR}/cufile.h")
+  # Fallback: try the parent include directory
+  set(SIRIUS_CUDA_INCLUDE_DIR "${_CUDA_ROOT}/include")
+endif()
+message(STATUS "Sirius CUDA include dir: ${SIRIUS_CUDA_INCLUDE_DIR}")
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
@@ -70,10 +81,10 @@ pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBIBVERBS IMPORTED_TARGET libibverbs)
 pkg_check_modules(LIBRDMACM IMPORTED_TARGET librdmacm)
 find_path(CUOBJCLIENT_INCLUDE_DIR cuobjclient.h
-  HINTS ${CUDAToolkit_INCLUDE_DIRS}
+  HINTS ${SIRIUS_CUDA_INCLUDE_DIR}
         /usr/local/cuda/targets/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/include)
 find_library(CUOBJCLIENT_LIBRARY cuobjclient
-  HINTS ${CUDAToolkit_LIBRARY_DIR}
+  HINTS ${_CUDA_ROOT}/targets/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/lib
         /usr/local/cuda/targets/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/lib)
 find_package(CURL CONFIG QUIET)
 if(CUOBJCLIENT_LIBRARY AND CUOBJCLIENT_INCLUDE_DIR AND LIBIBVERBS_FOUND AND LIBRDMACM_FOUND AND CURL_FOUND)
@@ -293,11 +304,11 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
-  # The CUDAToolkit_INCLUDE_DIRS path is needed when directly including KvikIO
+  # The CUDA toolkit include path is needed when directly including KvikIO
   # headers (e.g., kvikio/remote_handle.hpp) because KvikIO's cufile_h_wrapper
   # includes <cufile.h> which lives in the CUDA toolkit include directory.
-  if(DEFINED CUDAToolkit_INCLUDE_DIRS)
-    target_include_directories(${_target} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  if(EXISTS "${SIRIUS_CUDA_INCLUDE_DIR}")
+    target_include_directories(${_target} PRIVATE ${SIRIUS_CUDA_INCLUDE_DIR})
   endif()
 
   if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
@@ -307,6 +318,25 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   target_link_libraries(${_target} cudf::cudf rmm::rmm spdlog::spdlog
                         cuCascade::cucascade)
+
+  # Link kvikio for direct header usage (s3_datasource, gds_datasource).
+  # We can't use find_package(kvikio) because it triggers CUDA language conflicts
+  # in DuckDB's build system. Link the shared library directly instead.
+  find_library(_KVIKIO_LIB kvikio HINTS ${_CUDA_ROOT}/lib
+               "${CMAKE_PREFIX_PATH}/lib" NO_DEFAULT_PATH)
+  if(NOT _KVIKIO_LIB)
+    find_library(_KVIKIO_LIB kvikio)
+  endif()
+  if(_KVIKIO_LIB)
+    target_link_libraries(${_target} ${_KVIKIO_LIB})
+  endif()
+
+  # KvikIO compile definitions for direct header inclusion.
+  # These are normally provided by kvikio::kvikio INTERFACE_COMPILE_DEFINITIONS
+  # but we can't find_package(kvikio) without triggering CUDA language conflicts
+  # in DuckDB's build system. The pixi kvikio package has all three enabled.
+  target_compile_definitions(${_target} PRIVATE
+    KVIKIO_LIBCURL_FOUND KVIKIO_CUFILE_FOUND KVIKIO_CUFILE_VERSION_API_FOUND)
 
   # RDMA S3 support (cuObjClient + libcurl + RDMA verbs)
   if(SIRIUS_RDMA_SUPPORT)

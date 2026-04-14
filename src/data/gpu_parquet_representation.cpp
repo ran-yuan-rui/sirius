@@ -166,7 +166,7 @@ int64_t gpu_parquet_representation::compute_first_row_offset() const
   int64_t offset       = 0;
   auto first_rg        = _row_group_indices.front();
   for (cudf::size_type rg = 0; rg < first_rg; ++rg) {
-    offset += metadata.row_group(rg).num_rows();
+    offset += metadata.row_groups[rg].num_rows;
   }
   return offset;
 }

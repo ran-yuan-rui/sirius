@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <data/host_parquet_representation.hpp>  // for post_convert_fn_t
 #include <expression_executor/gpu_expression_translator.hpp>
 
 // cucascade

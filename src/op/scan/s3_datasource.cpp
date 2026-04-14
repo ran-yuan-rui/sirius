@@ -32,7 +32,7 @@ namespace sirius::op::scan {
 class s3_datasource::impl {
  public:
   impl(std::string const& url, [[maybe_unused]] object_store_config const& config)
-    : _handle(url), _file_size(_handle.nbytes())
+    : _handle(kvikio::RemoteHandle::open(url)), _file_size(_handle.nbytes())
   {
   }
 
