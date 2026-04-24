@@ -22,10 +22,12 @@
 #include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_translator.hpp>
 #include <helper/type_conversions.hpp>
+#include <io/datasource_factory.hpp>
 #include <log/logging.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <sirius_engine.hpp>
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -62,6 +64,36 @@
 #include <vector>
 
 namespace sirius::op::scan {
+
+namespace {
+
+constexpr std::string_view SIRIUS_READ_PARQUET_FN = "sirius_read_parquet";
+
+std::vector<std::string> extract_input_file_paths(sirius_physical_parquet_scan const* scan_op)
+{
+  if (scan_op->function.name == SIRIUS_READ_PARQUET_FN) {
+    if (scan_op->parameters.empty()) {
+      throw std::runtime_error(
+        "[parquet_scan_task_global_state] sirius_read_parquet scan is missing input parameters");
+    }
+    return {scan_op->parameters.front().GetValue<std::string>()};
+  }
+
+  auto& bind_data = scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
+  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+    throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
+  }
+
+  auto files = bind_data.file_list->GetAllFiles();
+  std::vector<std::string> file_paths;
+  file_paths.reserve(files.size());
+  std::for_each(files.begin(), files.end(), [&file_paths](auto const& file) {
+    file_paths.push_back(file.path);
+  });
+  return file_paths;
+}
+
+}  // namespace
 
 #if CUDF_VERSION_NUM < 2604
 namespace {
@@ -308,8 +340,13 @@ void parquet_scan_task_global_state::initialize_from_files()
   _metadata_byte_sizes.reserve(_file_paths.size());
   _footer_offsets.reserve(_file_paths.size());
 
+  // Route datasource construction through the per-engine factory so that
+  // non-local schemes (s3://, gds://, …) get dispatched to their registered
+  // ioctx instead of falling back to cudf's default local-file datasource.
+  auto& engine = get_pipeline()->get_engine();
   for (auto const& file_path : _file_paths) {
-    auto datasource      = cudf::io::datasource::create(file_path);
+    auto datasource =
+      io::datasource_factory::create(file_path, engine.datasource_registry(), engine.config());
     auto const file_size = datasource->size();
     datasources.push_back(std::move(datasource));
 
@@ -499,6 +536,16 @@ void parquet_scan_task_global_state::initialize_from_files()
       // clang-format on
     }
     auto const& file_metadata = _file_metadatas[file_idx];
+    std::vector<size_t> partition_column_indices;
+    if (is_projected) {
+      partition_column_indices = projected_column_indices;
+    } else if (!file_metadata.row_groups.empty()) {
+      auto const num_leaf_columns = file_metadata.row_groups.front().columns.size();
+      partition_column_indices.reserve(num_leaf_columns);
+      for (std::size_t col_idx = 0; col_idx < num_leaf_columns; ++col_idx) {
+        partition_column_indices.push_back(col_idx);
+      }
+    }
 
     // Build DuckDB index → parquet column position map for this file by name.
     std::vector<size_t> parquet_col_indices;
@@ -645,7 +692,9 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
 
   if (!_datasource) {
-    _datasource = cudf::io::datasource::create(g_state.get_file_path(l_state.get_file_idx()));
+    auto& engine = g_state.get_pipeline()->get_engine();
+    _datasource  = io::datasource_factory::create(
+      g_state.get_file_path(l_state.get_file_idx()), engine.datasource_registry(), engine.config());
   }
 
   auto reader = g_state.make_reader(l_state.get_file_idx());
@@ -689,18 +738,27 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   byte_ranges.emplace_back(footer_off, footer_size);  // footer + trailer
 
   // Read each byte range into the allocation asynchronously
-  int64_t bytes_read = 0;
+  std::size_t requested_bytes = 0;
   std::vector<std::future<std::size_t>> read_futures;
   for (auto const& range : byte_ranges) {
     read_range_into_allocation(
       range.offset(), range.size(), data_accessor, allocation, read_futures);
-    bytes_read += range.size();
+    requested_bytes += range.size();
   }
-  std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
+  std::size_t actual_bytes_read = 0;
+  std::for_each(read_futures.begin(), read_futures.end(), [&actual_bytes_read](auto& future) {
+    actual_bytes_read += future.get();
+  });
 
-  if (bytes_read != l_state.get_reserved_compressed_bytes()) {
+  if (actual_bytes_read != requested_bytes) {
     throw std::runtime_error(
-      "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
+      "[parquet_scan_task] Error in reading byte ranges: actual bytes read does not match "
+      "requested byte ranges");
+  }
+
+  if (requested_bytes > l_state.get_reserved_compressed_bytes()) {
+    throw std::runtime_error(
+      "[parquet_scan_task] Error in reading byte ranges: requested byte ranges exceed reserved "
       "compressed bytes");
   }
 
@@ -712,7 +770,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   g_state.get_options(),
                                                   std::move(l_state.get_rg_indices()),
                                                   std::move(byte_ranges),
-                                                  l_state.get_reserved_compressed_bytes(),
+                                                  actual_bytes_read,
                                                   l_state.get_reserved_uncompressed_bytes(),
                                                   file_size,
                                                   _datasource,

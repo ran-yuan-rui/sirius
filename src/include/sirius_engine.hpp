@@ -29,6 +29,7 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -41,9 +42,14 @@ namespace sirius::op {
 class sirius_physical_table_scan;
 }  // namespace sirius::op
 
+namespace sirius::io {
+class datasource_registry;
+}  // namespace sirius::io
+
 namespace sirius {
 
 struct operator_params;
+struct sirius_config;
 class sirius_interface;
 
 class sirius_engine {
@@ -52,9 +58,8 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
-    : context(context), sirius_iface(sirius_iface) {};
-  ~sirius_engine() {}
+  sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface);
+  ~sirius_engine();
 
   duckdb::ClientContext& context;
   sirius_interface& sirius_iface;
@@ -126,6 +131,23 @@ class sirius_engine {
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
   std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
+
+  //! Registry of per-scheme sirius_ioctx instances (file, s3, gds, ...).
+  //! Populated at construction with a default uring_ioctx for "file".
+  //! Object-store backends (s3, ...) are registered lazily from the active
+  //! sirius_config on first access once a SiriusContext is attached.
+  [[nodiscard]] io::datasource_registry& datasource_registry();
+
+  //! Returns the sirius_config attached to this engine's SiriusContext.
+  //! Required by datasource_factory::create so per-scheme backends (s3, gds,
+  //! ...) can consume object-store / tuning settings. Throws if SiriusContext
+  //! is not registered on the ClientContext — that registration happens at
+  //! extension load time, so this accessor is only safe to call during query
+  //! execution.
+  [[nodiscard]] sirius_config const& config() const;
+
+ private:
+  std::shared_ptr<io::datasource_registry> datasource_registry_;
 };
 
 }  // namespace sirius
