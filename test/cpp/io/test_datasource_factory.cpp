@@ -77,11 +77,7 @@ class mock_ioctx : public sirius_ioctx {
   {
     throw std::logic_error("unused");
   }
-  void host_read_async(sirius_io_object&,
-                       size_t,
-                       size_t,
-                       uint8_t*,
-                       io_completion_handler) override
+  void host_read_async(sirius_io_object&, size_t, size_t, uint8_t*, io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
@@ -92,11 +88,7 @@ class mock_ioctx : public sirius_ioctx {
   {
     throw std::logic_error("unused");
   }
-  size_t device_read_io(sirius_io_object&,
-                        size_t,
-                        size_t,
-                        uint8_t*,
-                        rmm::cuda_stream_view) override
+  size_t device_read_io(sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
   {
     throw std::logic_error("unused");
   }

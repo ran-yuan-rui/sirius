@@ -20,10 +20,12 @@
 #include "io/s3/sigv4.hpp"
 #include "io/sirius_datasource.hpp"
 
-#include <curl/curl.h>
-#include <cuda_runtime.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime.h>
+
+#include <curl/curl.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -375,15 +377,13 @@ void s3_ioctx::host_read_async(sirius_io_object& obj,
                  [this, &obj, offset, size, dst]() { return host_read(obj, offset, size, dst); });
 }
 
-void s3_ioctx::host_read_ranges_async(
-  sirius_io_object& obj,
-  std::vector<cudf::io::text::byte_range_info> const& ranges,
-  std::span<cudf::host_span<std::byte>> dst,
-  io_completion_handler handler)
+void s3_ioctx::host_read_ranges_async(sirius_io_object& obj,
+                                      std::vector<cudf::io::text::byte_range_info> const& ranges,
+                                      std::span<cudf::host_span<std::byte>> dst,
+                                      io_completion_handler handler)
 {
-  dispatch_async(std::move(handler), [this, &obj, ranges, dst]() {
-    return host_read_ranges(obj, ranges, dst);
-  });
+  dispatch_async(std::move(handler),
+                 [this, &obj, ranges, dst]() { return host_read_ranges(obj, ranges, dst); });
 }
 
 std::size_t s3_ioctx::host_read_ranges(sirius_io_object& obj,
@@ -412,8 +412,10 @@ std::size_t s3_ioctx::host_read_ranges(sirius_io_object& obj,
 // device_read / device_read_async first consults the (optional) prefetching
 // cache; these methods only run on cache miss.
 
-std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::device_read_io(
-  sirius_io_object& obj, std::size_t offset, std::size_t size, rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::device_read_io(sirius_io_object& obj,
+                                                                       std::size_t offset,
+                                                                       std::size_t size,
+                                                                       rmm::cuda_stream_view stream)
 {
   // Round-trip through a host-owned buffer, then copy onto a freshly-allocated
   // device buffer returned as an owned_buffer wrapping a device_buffer.
@@ -425,8 +427,8 @@ std::unique_ptr<cudf::io::datasource::buffer> s3_ioctx::device_read_io(
   // so the buffer is safe to hand to cudf.
   rmm::device_buffer device_buf(got, stream);
   if (got > 0) {
-    auto rc = cudaMemcpyAsync(
-      device_buf.data(), host.data(), got, cudaMemcpyHostToDevice, stream.value());
+    auto rc =
+      cudaMemcpyAsync(device_buf.data(), host.data(), got, cudaMemcpyHostToDevice, stream.value());
     if (rc != cudaSuccess) {
       throw std::runtime_error(std::string("s3_ioctx::device_read_io cudaMemcpyAsync failed: ") +
                                cudaGetErrorString(rc));
@@ -448,8 +450,7 @@ std::size_t s3_ioctx::device_read_io(sirius_io_object& obj,
   std::vector<std::uint8_t> host(size);
   auto got = host_read(obj, offset, size, host.data());
   if (got > 0) {
-    auto rc =
-      cudaMemcpyAsync(dst, host.data(), got, cudaMemcpyHostToDevice, stream.value());
+    auto rc = cudaMemcpyAsync(dst, host.data(), got, cudaMemcpyHostToDevice, stream.value());
     if (rc != cudaSuccess) {
       throw std::runtime_error(std::string("s3_ioctx::device_read_io cudaMemcpyAsync failed: ") +
                                cudaGetErrorString(rc));

@@ -21,6 +21,7 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
+#include <helper/type_conversions.hpp>
 #include <op/scan/parquet_scan_operator_data.hpp>
 #include <op/scan/sirius_gpu_parquet_scan_operator.hpp>
 #include <op/scan/sirius_parquet_metadata_scan_operator.hpp>
@@ -201,19 +202,25 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr,
   rmm::cuda_stream_view stream                             = cudf::get_default_stream())
 {
+  // Convert DuckDB types to Sirius types
+  auto sirius_output_types = sirius::from_duckdb_vec(output_types);
+
   // --- Pipeline 1: metadata scan ---
-  sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(output_types,
-                                                                      0,
-                                                                      file_paths,
-                                                                      column_ids,
-                                                                      projection_ids,
-                                                                      names,
-                                                                      approximate_batch_size,
-                                                                      std::move(table_filters));
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius_output_types, 0);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
+    &gpu_op,
+    sirius_output_types,
+    sirius_output_types,
+    0,
+    file_paths,
+    column_ids,
+    projection_ids,
+    names,
+    std::move(table_filters),
+    {},
+    approximate_batch_size);
   metadata_operator_execution_fixture metadata_fixture(con);
   metadata_fixture.bind(metadata_op);
-
-  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(output_types, 0, gpu_space);
 
   // Execute all metadata tasks and sink results into the GPU operator.
   while (!metadata_op.all_ports_empty()) {
@@ -225,7 +232,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   }
 
   // --- Pipeline 1 → Pipeline 2 transition ---
-  gpu_op.finalize_metadata();
+  gpu_op.finalize_partitions();
 
   // --- Pipeline 2: GPU scan ---
   std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
@@ -305,8 +312,20 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
+  auto sirius_types = sirius::from_duckdb_vec(schema.types);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius_types, 0);
   sirius::op::scan::sirius_parquet_metadata_scan_operator op(
-    schema.types, 0, files, schema.column_ids, no_projection, schema.names, 1024 * 1024);
+    &gpu_op,
+    sirius_types,
+    sirius_types,
+    0,
+    files,
+    schema.column_ids,
+    no_projection,
+    schema.names,
+    nullptr,
+    {},
+    1024 * 1024);
 
   REQUIRE(op.is_source());
   REQUIRE_FALSE(op.all_ports_empty());
@@ -337,8 +356,20 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
   std::vector<std::string> files = {path.string()};
   duckdb::vector<duckdb::idx_t> no_projection;
 
+  auto sirius_types = sirius::from_duckdb_vec(schema.types);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius_types, 0);
   sirius::op::scan::sirius_parquet_metadata_scan_operator op(
-    schema.types, 0, files, schema.column_ids, no_projection, schema.names, 1024 * 1024);
+    &gpu_op,
+    sirius_types,
+    sirius_types,
+    0,
+    files,
+    schema.column_ids,
+    no_projection,
+    schema.names,
+    nullptr,
+    {},
+    1024 * 1024);
   metadata_operator_execution_fixture metadata_fixture(con);
   metadata_fixture.bind(op);
 
@@ -711,7 +742,8 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
 
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType::INTEGER);
-  sirius::op::scan::sirius_gpu_parquet_scan_operator op(types, 0, *gpu_space);
+  auto sirius_types = sirius::from_duckdb_vec(types);
+  sirius::op::scan::sirius_gpu_parquet_scan_operator op(sirius_types, 0);
 
   REQUIRE(op.is_sink());
   REQUIRE(op.is_source());
@@ -722,9 +754,8 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
   REQUIRE(op.get_next_task_input_data() == nullptr);
 
   // Finalize with no metadata → no partitions.
-  op.finalize_metadata();
+  op.finalize_partitions();
   REQUIRE(op.all_ports_empty());
-  REQUIRE(op.get_total_partitions() == 0);
 }
 
 TEST_CASE("two-pipeline scan - diverse types with filter on INTEGER",

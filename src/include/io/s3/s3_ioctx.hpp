@@ -99,10 +99,11 @@ class s3_ioctx final : public sirius_ioctx {
   // caller-supplied device pointer / stream. The base-class device_read()
   // consults the (currently unused) cache before falling through to these.
 
-  std::unique_ptr<cudf::io::datasource::buffer> device_read_io(sirius_io_object& obj,
-                                                               std::size_t offset,
-                                                               std::size_t size,
-                                                               rmm::cuda_stream_view stream) override;
+  std::unique_ptr<cudf::io::datasource::buffer> device_read_io(
+    sirius_io_object& obj,
+    std::size_t offset,
+    std::size_t size,
+    rmm::cuda_stream_view stream) override;
 
   std::size_t device_read_io(sirius_io_object& obj,
                              std::size_t offset,
@@ -121,8 +122,8 @@ class s3_ioctx final : public sirius_ioctx {
 
   /// S3 over HTTP has no alignment requirement; return the logical range
   /// clipped to file size.
-  cudf::io::text::byte_range_info compute_physical_range(
-    cudf::io::text::byte_range_info logical, std::size_t file_size) const override;
+  cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
+                                                         std::size_t file_size) const override;
 
  private:
   struct handle_slot;

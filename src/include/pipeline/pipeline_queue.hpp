@@ -16,6 +16,10 @@
 
 #pragma once
 
+// BlockingConcurrentQueue uses BLOCK_SIZE as a variable name, which conflicts with
+// macros defined in some system headers (like liburing or duckdb)
+#undef BLOCK_SIZE
+
 #include "config.hpp"
 #include "gpu_pipeline.hpp"
 #include "parallel/task_executor.hpp"

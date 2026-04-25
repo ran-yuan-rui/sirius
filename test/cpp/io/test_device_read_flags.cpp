@@ -76,11 +76,7 @@ class probe_ioctx : public sirius_ioctx {
   {
     throw std::logic_error("unused");
   }
-  void host_read_async(sirius_io_object&,
-                       size_t,
-                       size_t,
-                       uint8_t*,
-                       io_completion_handler) override
+  void host_read_async(sirius_io_object&, size_t, size_t, uint8_t*, sirius::io::io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
@@ -100,14 +96,14 @@ class probe_ioctx : public sirius_ioctx {
                             size_t,
                             uint8_t*,
                             rmm::cuda_stream_view,
-                            io_completion_handler) override
+                            sirius::io::io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
   void host_read_ranges_async(sirius_io_object&,
                               std::vector<cudf::io::text::byte_range_info> const&,
                               std::span<cudf::host_span<std::byte>>,
-                              io_completion_handler) override
+                              sirius::io::io_completion_handler) override
   {
     throw std::logic_error("unused");
   }

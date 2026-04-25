@@ -538,7 +538,7 @@ void parquet_scan_task_global_state::initialize_from_files()
     auto const& file_metadata = _file_metadatas[file_idx];
     std::vector<size_t> partition_column_indices;
     if (is_projected) {
-      partition_column_indices = projected_column_indices;
+      partition_column_indices = _selected_column_indices;
     } else if (!file_metadata.row_groups.empty()) {
       auto const num_leaf_columns = file_metadata.row_groups.front().columns.size();
       partition_column_indices.reserve(num_leaf_columns);
