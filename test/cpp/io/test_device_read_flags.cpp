@@ -43,9 +43,8 @@ using sirius::io::uring_ioctx;
 
 namespace {
 
-// Test-only io_object: sirius_datasource stores a unique_ptr<sirius_io_object>
-// but the capability-flag paths never touch it, so size()/cache_id() just
-// return inert values.
+// Test-only io_object: these tests only exercise sirius_datasource surface
+// flags, so the backing object can be inert.
 class mock_io_object : public sirius_io_object {
  public:
   [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _id; }
@@ -55,21 +54,16 @@ class mock_io_object : public sirius_io_object {
   std::string _id{"mock"};
 };
 
-// Test-only sirius_ioctx whose device-read capability flags can be toggled
-// independently. All read methods throw — the sirius_datasource forwarding
-// tests only probe the two cap hooks, never the IO path.
-class cap_probe_ioctx : public sirius_ioctx {
+// Minimal test-only sirius_ioctx implementing the new IO-framework contract.
+// All read entry points throw because these tests only care about the
+// sirius_datasource capability surface, not the read path itself.
+class probe_ioctx : public sirius_ioctx {
  public:
-  cap_probe_ioctx(bool supports, bool preferred) : _supports(supports), _preferred(preferred) {}
-
-  [[nodiscard]] bool supports_device_read() const override { return _supports; }
-  [[nodiscard]] bool is_device_read_preferred(size_t) const override { return _preferred; }
-
   void shutdown() override {}
 
   std::unique_ptr<cudf::io::datasource> make_datasource(std::unique_ptr<sirius_io_object>) override
   {
-    throw std::logic_error("cap_probe_ioctx::make_datasource: not exercised");
+    throw std::logic_error("probe_ioctx::make_datasource: not exercised");
   }
 
   size_t host_read(sirius_io_object&, size_t, size_t, uint8_t*) override
@@ -82,35 +76,38 @@ class cap_probe_ioctx : public sirius_ioctx {
   {
     throw std::logic_error("unused");
   }
-  std::future<size_t> host_read_async(sirius_io_object&, size_t, size_t, uint8_t*) override
+  void host_read_async(sirius_io_object&,
+                       size_t,
+                       size_t,
+                       uint8_t*,
+                       io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
-  std::future<std::unique_ptr<cudf::io::datasource::buffer>> host_read_async(sirius_io_object&,
-                                                                             size_t,
-                                                                             size_t) override
+  std::unique_ptr<cudf::io::datasource::buffer> device_read_io(sirius_io_object&,
+                                                               size_t,
+                                                               size_t,
+                                                               rmm::cuda_stream_view) override
   {
     throw std::logic_error("unused");
   }
-  std::unique_ptr<cudf::io::datasource::buffer> device_read(sirius_io_object&,
-                                                            size_t,
-                                                            size_t,
-                                                            rmm::cuda_stream_view) override
+  size_t device_read_io(sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
   {
     throw std::logic_error("unused");
   }
-  size_t device_read(sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
+  void device_read_io_async(sirius_io_object&,
+                            size_t,
+                            size_t,
+                            uint8_t*,
+                            rmm::cuda_stream_view,
+                            io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
-  std::future<size_t> device_read_async(
-    sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
-  {
-    throw std::logic_error("unused");
-  }
-  std::future<size_t> host_read_ranges_async(sirius_io_object&,
-                                             std::vector<cudf::io::text::byte_range_info> const&,
-                                             std::span<cudf::host_span<std::byte>>) override
+  void host_read_ranges_async(sirius_io_object&,
+                              std::vector<cudf::io::text::byte_range_info> const&,
+                              std::span<cudf::host_span<std::byte>>,
+                              io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
@@ -120,10 +117,11 @@ class cap_probe_ioctx : public sirius_ioctx {
   {
     throw std::logic_error("unused");
   }
-
- private:
-  bool _supports;
-  bool _preferred;
+  cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
+                                                         size_t) const override
+  {
+    return logical;
+  }
 };
 
 std::shared_ptr<uring_ioctx> try_make_uring_ioctx()
@@ -141,7 +139,7 @@ std::shared_ptr<uring_ioctx> try_make_uring_ioctx()
 
 }  // namespace
 
-TEST_CASE("uring_ioctx_does_not_prefer_device_read", "[io_caps]")
+TEST_CASE("uring-backed sirius_datasource advertises device reads", "[io_caps]")
 {
   auto ctx = try_make_uring_ioctx();
   if (!ctx) {
@@ -149,36 +147,24 @@ TEST_CASE("uring_ioctx_does_not_prefer_device_read", "[io_caps]")
     return;
   }
 
-  // supports_device_read() stays true — the bounce-buffer path can still
-  // land bytes in device memory if a caller explicitly asks for it.
-  CHECK(ctx->supports_device_read());
+  sirius_datasource ds{ctx, std::make_unique<mock_io_object>()};
 
-  // But is_device_read_preferred() must be false: the uring path is a pinned
-  // host bounce + cudaMemcpyAsync, strictly slower than a plain host_read.
-  // Flipping this to false is what PR4 is about — we do not want cuDF or any
-  // other caller to silently route through the bounce path when host_read
-  // would do.
-  CHECK_FALSE(ctx->is_device_read_preferred(0));
-  CHECK_FALSE(ctx->is_device_read_preferred(1UL << 10));
-  CHECK_FALSE(ctx->is_device_read_preferred(1UL << 30));
+  // In the new IO framework, sirius_datasource always exposes a device-read
+  // path. Backends may use direct device IO or a host-bounce implementation,
+  // but callers no longer branch on per-ioctx capability flags.
+  CHECK(ds.supports_device_read());
+  CHECK(ds.is_device_read_preferred(0));
+  CHECK(ds.is_device_read_preferred(1UL << 10));
+  CHECK(ds.is_device_read_preferred(1UL << 30));
 }
 
-TEST_CASE("sirius_datasource_forwards_caps_from_ioctx", "[io_caps]")
+TEST_CASE("sirius_datasource device-read flags are backend-agnostic", "[io_caps]")
 {
-  // Each permutation of the two flags must round-trip through sirius_datasource
-  // unchanged. This is the load-bearing contract for PR6/PR9/PR10: per-backend
-  // ioctx decides its own caps, sirius_datasource is a pure forwarder.
-  struct case_t {
-    bool supports;
-    bool preferred;
-  };
-  for (auto const c :
-       {case_t{true, true}, case_t{true, false}, case_t{false, true}, case_t{false, false}}) {
-    auto ctx = std::make_shared<cap_probe_ioctx>(c.supports, c.preferred);
-    sirius_datasource ds{ctx, std::make_unique<mock_io_object>()};
+  auto ctx = std::make_shared<probe_ioctx>();
+  sirius_datasource ds{ctx, std::make_unique<mock_io_object>()};
 
-    CHECK(ds.supports_device_read() == c.supports);
-    CHECK(ds.is_device_read_preferred(0) == c.preferred);
-    CHECK(ds.is_device_read_preferred(1UL << 20) == c.preferred);
-  }
+  CHECK(ds.io_ctx().get() == ctx.get());
+  CHECK(ds.supports_device_read());
+  CHECK(ds.is_device_read_preferred(0));
+  CHECK(ds.is_device_read_preferred(1UL << 20));
 }

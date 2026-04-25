@@ -47,8 +47,9 @@ namespace {
 // ---------------------------------------------------------------------------
 // mock ioctx
 // ---------------------------------------------------------------------------
-// A test-only sirius_ioctx that counts make_datasource calls. Its read methods
-// are not exercised in PR1 tests; they throw if called to surface misuse.
+// A test-only sirius_ioctx that satisfies the current IO-framework contract.
+// These tests never drive actual IO through the mock; every read entry point
+// throws so misuse is surfaced immediately.
 // ---------------------------------------------------------------------------
 
 class mock_ioctx : public sirius_ioctx {
@@ -64,10 +65,8 @@ class mock_ioctx : public sirius_ioctx {
     throw std::runtime_error("mock_ioctx::make_datasource: not exercised in PR1");
   }
 
-  [[nodiscard]] bool supports_device_read() const override { return false; }
-  [[nodiscard]] bool is_device_read_preferred(size_t) const override { return false; }
-
-  // Unused read APIs — PR1 does not drive IO through the mock.
+  // Unused read APIs — datasource_factory coverage never drives IO through the
+  // mock backend.
   size_t host_read(sirius_io_object&, size_t, size_t, uint8_t*) override
   {
     throw std::logic_error("unused");
@@ -78,35 +77,42 @@ class mock_ioctx : public sirius_ioctx {
   {
     throw std::logic_error("unused");
   }
-  std::future<size_t> host_read_async(sirius_io_object&, size_t, size_t, uint8_t*) override
+  void host_read_async(sirius_io_object&,
+                       size_t,
+                       size_t,
+                       uint8_t*,
+                       io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
-  std::future<std::unique_ptr<cudf::io::datasource::buffer>> host_read_async(sirius_io_object&,
-                                                                             size_t,
-                                                                             size_t) override
+  std::unique_ptr<cudf::io::datasource::buffer> device_read_io(sirius_io_object&,
+                                                               size_t,
+                                                               size_t,
+                                                               rmm::cuda_stream_view) override
   {
     throw std::logic_error("unused");
   }
-  std::unique_ptr<cudf::io::datasource::buffer> device_read(sirius_io_object&,
-                                                            size_t,
-                                                            size_t,
-                                                            rmm::cuda_stream_view) override
+  size_t device_read_io(sirius_io_object&,
+                        size_t,
+                        size_t,
+                        uint8_t*,
+                        rmm::cuda_stream_view) override
   {
     throw std::logic_error("unused");
   }
-  size_t device_read(sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
+  void device_read_io_async(sirius_io_object&,
+                            size_t,
+                            size_t,
+                            uint8_t*,
+                            rmm::cuda_stream_view,
+                            io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
-  std::future<size_t> device_read_async(
-    sirius_io_object&, size_t, size_t, uint8_t*, rmm::cuda_stream_view) override
-  {
-    throw std::logic_error("unused");
-  }
-  std::future<size_t> host_read_ranges_async(sirius_io_object&,
-                                             std::vector<cudf::io::text::byte_range_info> const&,
-                                             std::span<cudf::host_span<std::byte>>) override
+  void host_read_ranges_async(sirius_io_object&,
+                              std::vector<cudf::io::text::byte_range_info> const&,
+                              std::span<cudf::host_span<std::byte>>,
+                              io_completion_handler) override
   {
     throw std::logic_error("unused");
   }
@@ -115,6 +121,11 @@ class mock_ioctx : public sirius_ioctx {
                           std::span<cudf::host_span<std::byte>>) override
   {
     throw std::logic_error("unused");
+  }
+  cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
+                                                         size_t) const override
+  {
+    return logical;
   }
 };
 
