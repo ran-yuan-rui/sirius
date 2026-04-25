@@ -255,17 +255,17 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       "parquet scans.");
   }
 
-  // Expect parquet_scan to be bound through the multi-file reader
-  auto& bind_data = scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
-  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
-    throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
-  }
-
-  // Detect hive partition columns — these exist in the DuckDB schema but not in parquet files.
-  // Their values come from directory paths (e.g., partition_col=42/).
-  for (auto const& hpi : bind_data.reader_bind.hive_partitioning_indexes) {
-    _hive_partition_index_set.insert(hpi.index);
-    _hive_partition_columns.push_back(hive_partition_column{hpi.value, hpi.index});
+  // sirius_read_parquet feeds a single URI through scan_op->parameters[0] and
+  // returns nullptr from its Bind, so it has no MultiFileBindData and no hive
+  // partitioning. Standard parquet_scan / read_parquet still go through the
+  // multi-file reader.
+  duckdb::MultiFileBindData const* bind_data = nullptr;
+  if (scan_op->function.name != SIRIUS_READ_PARQUET_FN) {
+    bind_data = &scan_op->bind_data->Cast<duckdb::MultiFileBindData>();
+    for (auto const& hpi : bind_data->reader_bind.hive_partitioning_indexes) {
+      _hive_partition_index_set.insert(hpi.index);
+      _hive_partition_columns.push_back(hive_partition_column{hpi.value, hpi.index});
+    }
   }
 
   // Build selected column indices, then drop any hive partition columns (they are injected
@@ -280,15 +280,15 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       _selected_column_indices.end());
   }
 
-  auto files = bind_data.file_list->GetAllFiles();
-  _file_paths.reserve(files.size());
-  std::for_each(
-    files.begin(), files.end(), [this](auto const& file) { _file_paths.push_back(file.path); });
+  _file_paths = extract_input_file_paths(scan_op);
+  if (_file_paths.empty()) {
+    throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
+  }
 
   initialize_from_files();
 
   // Build partition injection function if this scan has partition columns.
-  init_hive_partitions(bind_data, scan_op);
+  if (bind_data != nullptr) { init_hive_partitions(*bind_data, scan_op); }
 }
 
 // Protected constructor: caller supplies pre-resolved file paths and column indices.
@@ -536,16 +536,6 @@ void parquet_scan_task_global_state::initialize_from_files()
       // clang-format on
     }
     auto const& file_metadata = _file_metadatas[file_idx];
-    std::vector<size_t> partition_column_indices;
-    if (is_projected) {
-      partition_column_indices = _selected_column_indices;
-    } else if (!file_metadata.row_groups.empty()) {
-      auto const num_leaf_columns = file_metadata.row_groups.front().columns.size();
-      partition_column_indices.reserve(num_leaf_columns);
-      for (std::size_t col_idx = 0; col_idx < num_leaf_columns; ++col_idx) {
-        partition_column_indices.push_back(col_idx);
-      }
-    }
 
     // Build DuckDB index → parquet column position map for this file by name.
     std::vector<size_t> parquet_col_indices;
