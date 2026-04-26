@@ -207,18 +207,17 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
 
   // --- Pipeline 1: metadata scan ---
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius_output_types, 0);
-  sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(
-    &gpu_op,
-    sirius_output_types,
-    sirius_output_types,
-    0,
-    file_paths,
-    column_ids,
-    projection_ids,
-    names,
-    std::move(table_filters),
-    {},
-    approximate_batch_size);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator metadata_op(&gpu_op,
+                                                                      sirius_output_types,
+                                                                      sirius_output_types,
+                                                                      0,
+                                                                      file_paths,
+                                                                      column_ids,
+                                                                      projection_ids,
+                                                                      names,
+                                                                      std::move(table_filters),
+                                                                      {},
+                                                                      approximate_batch_size);
   metadata_operator_execution_fixture metadata_fixture(con);
   metadata_fixture.bind(metadata_op);
 
@@ -314,18 +313,17 @@ TEST_CASE("metadata_scan_operator - source interface dispatches all files",
 
   auto sirius_types = sirius::from_duckdb_vec(schema.types);
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius_types, 0);
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(
-    &gpu_op,
-    sirius_types,
-    sirius_types,
-    0,
-    files,
-    schema.column_ids,
-    no_projection,
-    schema.names,
-    nullptr,
-    {},
-    1024 * 1024);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
+                                                             sirius_types,
+                                                             sirius_types,
+                                                             0,
+                                                             files,
+                                                             schema.column_ids,
+                                                             no_projection,
+                                                             schema.names,
+                                                             nullptr,
+                                                             {},
+                                                             1024 * 1024);
 
   REQUIRE(op.is_source());
   REQUIRE_FALSE(op.all_ports_empty());
@@ -358,18 +356,17 @@ TEST_CASE("metadata_scan_operator - execute produces partitioned metadata",
 
   auto sirius_types = sirius::from_duckdb_vec(schema.types);
   sirius::op::scan::sirius_gpu_parquet_scan_operator gpu_op(sirius_types, 0);
-  sirius::op::scan::sirius_parquet_metadata_scan_operator op(
-    &gpu_op,
-    sirius_types,
-    sirius_types,
-    0,
-    files,
-    schema.column_ids,
-    no_projection,
-    schema.names,
-    nullptr,
-    {},
-    1024 * 1024);
+  sirius::op::scan::sirius_parquet_metadata_scan_operator op(&gpu_op,
+                                                             sirius_types,
+                                                             sirius_types,
+                                                             0,
+                                                             files,
+                                                             schema.column_ids,
+                                                             no_projection,
+                                                             schema.names,
+                                                             nullptr,
+                                                             {},
+                                                             1024 * 1024);
   metadata_operator_execution_fixture metadata_fixture(con);
   metadata_fixture.bind(op);
 
