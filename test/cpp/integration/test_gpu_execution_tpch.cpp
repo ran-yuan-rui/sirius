@@ -2765,28 +2765,28 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   // With 600K rows and 1KB max partition, we must have many partitions.
   // Verify the data is non-trivially large (ensures partitioning actually happened).
   REQUIRE(gpu_result->RowCount() > 1000);
-  // Sort both result sets for deterministic comparison
-  auto gpu_sorted = con->Query("SELECT * FROM gpu_execution('" + query + "') ORDER BY 1, 2");
-  auto cpu_sorted = con->Query("SELECT * FROM (" + query + ") t ORDER BY 1, 2");
-  REQUIRE(gpu_sorted);
-  REQUIRE_FALSE(gpu_sorted->HasError());
-  REQUIRE(cpu_sorted);
-  REQUIRE_FALSE(cpu_sorted->HasError());
+  auto gpu_rows = collect_sorted_rows(*gpu_result);
+  auto cpu_rows = collect_sorted_rows(*cpu_result);
 
   // Compare every cell
   duckdb::idx_t mismatches = 0;
-  for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-    for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-      auto gpu_val = gpu_sorted->GetValue(c, r).ToString();
-      auto cpu_val = cpu_sorted->GetValue(c, r).ToString();
-      if (gpu_val != cpu_val) {
+  for (duckdb::idx_t r = 0; r < gpu_result->RowCount(); r++) {
+    for (duckdb::idx_t c = 0; c < gpu_result->ColumnCount(); c++) {
+      auto const& gpu_val = gpu_rows[r].cells[c];
+      auto const& cpu_val = cpu_rows[r].cells[c];
+      if (gpu_val.is_null != cpu_val.is_null) {
+        UNSCOPED_INFO("Row " << r << " Col " << c << " nullability mismatch: GPU=["
+                             << gpu_val.text << "] CPU=[" << cpu_val.text << "]");
+      }
+      REQUIRE(gpu_val.is_null == cpu_val.is_null);
+      if (gpu_val.text != cpu_val.text) {
         if (mismatches < 5) {
-          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_val << "] CPU=["
-                               << cpu_val << "]");
+          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_val.text
+                               << "] CPU=[" << cpu_val.text << "]");
         }
         mismatches++;
       }
-      REQUIRE(gpu_val == cpu_val);
+      REQUIRE(gpu_val.text == cpu_val.text);
     }
   }
 }
@@ -2818,28 +2818,28 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   // With 600K rows and 1KB max partition, we must have many partitions.
   // Verify the data is non-trivially large (ensures partitioning actually happened).
   REQUIRE(gpu_result->RowCount() > 1000);
-  // Sort both result sets for deterministic comparison
-  auto gpu_sorted = con->Query("SELECT * FROM gpu_execution('" + query + "') ORDER BY 1, 2");
-  auto cpu_sorted = con->Query("SELECT * FROM (" + query + ") t ORDER BY 1, 2");
-  REQUIRE(gpu_sorted);
-  REQUIRE_FALSE(gpu_sorted->HasError());
-  REQUIRE(cpu_sorted);
-  REQUIRE_FALSE(cpu_sorted->HasError());
+  auto gpu_rows = collect_sorted_rows(*gpu_result);
+  auto cpu_rows = collect_sorted_rows(*cpu_result);
 
   // Compare every cell
   duckdb::idx_t mismatches = 0;
-  for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-    for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-      auto gpu_val = gpu_sorted->GetValue(c, r).ToString();
-      auto cpu_val = cpu_sorted->GetValue(c, r).ToString();
-      if (gpu_val != cpu_val) {
+  for (duckdb::idx_t r = 0; r < gpu_result->RowCount(); r++) {
+    for (duckdb::idx_t c = 0; c < gpu_result->ColumnCount(); c++) {
+      auto const& gpu_val = gpu_rows[r].cells[c];
+      auto const& cpu_val = cpu_rows[r].cells[c];
+      if (gpu_val.is_null != cpu_val.is_null) {
+        UNSCOPED_INFO("Row " << r << " Col " << c << " nullability mismatch: GPU=["
+                             << gpu_val.text << "] CPU=[" << cpu_val.text << "]");
+      }
+      REQUIRE(gpu_val.is_null == cpu_val.is_null);
+      if (gpu_val.text != cpu_val.text) {
         if (mismatches < 5) {
-          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_val << "] CPU=["
-                               << cpu_val << "]");
+          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_val.text
+                               << "] CPU=[" << cpu_val.text << "]");
         }
         mismatches++;
       }
-      REQUIRE(gpu_val == cpu_val);
+      REQUIRE(gpu_val.text == cpu_val.text);
     }
   }
 }
