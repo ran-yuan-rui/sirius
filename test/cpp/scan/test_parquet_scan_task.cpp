@@ -55,9 +55,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
+#include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -74,6 +77,59 @@ using batch_validator_t = void (*)(const std::vector<std::shared_ptr<cucascade::
                                    size_t,
                                    cucascade::memory::memory_reservation_manager&,
                                    rmm::cuda_stream_view);
+
+class scan_test_watchdog {
+ public:
+  explicit scan_test_watchdog(std::chrono::seconds timeout) : _timeout(timeout)
+  {
+    _thread = std::thread([this] { run(); });
+  }
+
+  ~scan_test_watchdog()
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _done = true;
+    }
+    _cv.notify_all();
+    if (_thread.joinable()) { _thread.join(); }
+  }
+
+  void phase(std::string phase)
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _phase       = std::move(phase);
+      _phase_start = std::chrono::steady_clock::now();
+    }
+    _cv.notify_all();
+  }
+
+ private:
+  void run()
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    while (!_done) {
+      auto const deadline = _phase_start + _timeout;
+      if (_cv.wait_until(lock, deadline, [this] { return _done; })) { return; }
+      if (_done || std::chrono::steady_clock::now() < deadline) { continue; }
+
+      auto phase = _phase;
+      lock.unlock();
+      std::cerr << "[parquet_scan_task_test] timed out after " << _timeout.count()
+                << "s while " << phase << std::endl;
+      std::abort();
+    }
+  }
+
+  std::chrono::seconds _timeout;
+  std::mutex _mutex;
+  std::condition_variable _cv;
+  bool _done{false};
+  std::string _phase{"initializing"};
+  std::chrono::steady_clock::time_point _phase_start{std::chrono::steady_clock::now()};
+  std::thread _thread;
+};
 
 /**
  * Minimal concrete executor for scan task tests.
@@ -135,6 +191,12 @@ static void wait_for_scan_tasks(scan_test_executor& executor, size_t scheduled)
     if (executor.has_worker_exception()) { break; }
     if (std::chrono::steady_clock::now() >= deadline) { break; }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  if (executor.completed_tasks() != scheduled && !executor.has_worker_exception()) {
+    std::cerr << "[parquet_scan_task_test] timed out waiting for parquet scan tasks: completed "
+              << executor.completed_tasks() << " of " << scheduled << std::endl;
+    std::abort();
   }
 
   executor.stop();
@@ -416,11 +478,15 @@ static void run_parquet_scan_test(std::string const& table_name,
                                   batch_validator_t validator   = validate_scanned_batches,
                                   table_creator_t table_creator = create_synthetic_table)
 {
+  scan_test_watchdog watchdog(std::chrono::seconds(120));
+  watchdog.phase("creating parquet scan test table");
   auto [db_owner, con] = sirius::make_test_db_and_connection();
 
   table_creator(con, table_name, num_rows);
+  watchdog.phase("writing parquet scan test file");
   auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
 
+  watchdog.phase("initializing parquet scan test context");
   auto& client_ctx = *con.context;
   auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
   auto& mem_mgr    = sirius_ctx->get_memory_manager();
@@ -436,6 +502,7 @@ static void run_parquet_scan_test(std::string const& table_name,
     make_parquet_scan(client_ctx, parquet_path.string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
+  watchdog.phase("initializing parquet scan global state");
   parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
     pipeline_fixture.pipeline, physical_scan.get(), batch_size);
@@ -471,9 +538,12 @@ static void run_parquet_scan_test(std::string const& table_name,
 
   // The stream must be declared before batches so it outlives GPU data allocated on it.
   rmm::cuda_stream stream;
+  watchdog.phase("running parquet scan tasks");
   auto batches = run_scan();
+  watchdog.phase("validating parquet scan batches");
   validator(batches, num_rows, mem_mgr, stream);
 
+  watchdog.phase("cleaning up parquet scan test");
   // End the transaction.
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
@@ -494,10 +564,13 @@ static void run_multi_file_parquet_scan_test(
   duckdb::vector<duckdb::idx_t> const& projection_indices = {},
   batch_validator_t validator                             = validate_scanned_batches)
 {
+  scan_test_watchdog watchdog(std::chrono::seconds(120));
+  watchdog.phase("creating multi-file parquet scan test tables");
   REQUIRE(!file_row_counts.empty());
 
   auto [db_owner, con] = sirius::make_test_db_and_connection();
 
+  watchdog.phase("writing multi-file parquet scan test files");
   auto parquet_dir = std::filesystem::temp_directory_path() / (table_prefix + "_multi_file");
   std::filesystem::remove_all(parquet_dir);
   std::filesystem::create_directories(parquet_dir);
@@ -517,6 +590,7 @@ static void run_multi_file_parquet_scan_test(
     total_rows += row_count;
   }
 
+  watchdog.phase("initializing multi-file parquet scan test context");
   auto& client_ctx = *con.context;
   auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
   auto& mem_mgr    = sirius_ctx->get_memory_manager();
@@ -531,6 +605,7 @@ static void run_multi_file_parquet_scan_test(
     client_ctx, (parquet_dir / "*.parquet").string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
+  watchdog.phase("initializing multi-file parquet scan global state");
   parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
     pipeline_fixture.pipeline, physical_scan.get(), batch_size);
@@ -566,9 +641,12 @@ static void run_multi_file_parquet_scan_test(
 
   // The stream must be declared before batches so it outlives GPU data allocated on it.
   rmm::cuda_stream stream;
+  watchdog.phase("running multi-file parquet scan tasks");
   auto batches = run_scan();
+  watchdog.phase("validating multi-file parquet scan batches");
   validator(batches, total_rows, mem_mgr, stream);
 
+  watchdog.phase("cleaning up multi-file parquet scan test");
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
   REQUIRE(!commit_result->HasError());
@@ -592,12 +670,16 @@ static void run_parquet_scan_test_with_filter(
   duckdb::vector<duckdb::idx_t> const& projection_indices = {},
   batch_validator_t validator                             = validate_scanned_batches)
 {
+  scan_test_watchdog watchdog(std::chrono::seconds(120));
+  watchdog.phase("creating filtered parquet scan test table");
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
 
   create_synthetic_table(con, table_name, num_rows);
+  watchdog.phase("writing filtered parquet scan test file");
   auto parquet_path = write_parquet_from_table(con, table_name, row_group_size);
 
+  watchdog.phase("initializing filtered parquet scan test context");
   auto& client_ctx = *con.context;
   auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
   auto& mem_mgr    = sirius_ctx->get_memory_manager();
@@ -612,6 +694,7 @@ static void run_parquet_scan_test_with_filter(
     client_ctx, parquet_path.string(), std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
+  watchdog.phase("initializing filtered parquet scan global state");
   parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
     pipeline_fixture.pipeline, physical_scan.get(), batch_size);
@@ -645,9 +728,12 @@ static void run_parquet_scan_test_with_filter(
     return batches;
   };
 
+  watchdog.phase("running filtered parquet scan tasks");
   auto batches = run_scan();
+  watchdog.phase("validating filtered parquet scan batches");
   validator(batches, expected_rows, mem_mgr, rmm::cuda_stream_default);
 
+  watchdog.phase("cleaning up filtered parquet scan test");
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
   REQUIRE(!commit_result->HasError());
