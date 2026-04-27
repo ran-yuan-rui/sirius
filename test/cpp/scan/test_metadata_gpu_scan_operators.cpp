@@ -198,7 +198,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   duckdb::vector<duckdb::idx_t> projection_ids,
   duckdb::vector<std::string> names,
   std::size_t approximate_batch_size,
-  cucascade::memory::memory_space& gpu_space,
+  cucascade::memory::memory_space&,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr,
   rmm::cuda_stream_view stream                             = cudf::get_default_stream())
 {

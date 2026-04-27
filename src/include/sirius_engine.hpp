@@ -140,10 +140,8 @@ class sirius_engine {
 
   //! Returns the sirius_config attached to this engine's SiriusContext.
   //! Required by datasource_factory::create so per-scheme backends (s3, gds,
-  //! ...) can consume object-store / tuning settings. Throws if SiriusContext
-  //! is not registered on the ClientContext — that registration happens at
-  //! extension load time, so this accessor is only safe to call during query
-  //! execution.
+  //! ...) can consume object-store / tuning settings. If SiriusContext is not
+  //! registered on the ClientContext, returns a process-wide default config.
   [[nodiscard]] sirius_config const& config() const;
 
  private:

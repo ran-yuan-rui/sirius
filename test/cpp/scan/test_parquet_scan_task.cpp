@@ -26,6 +26,9 @@
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
+#include <pipeline/sirius_pipeline.hpp>
+#include <sirius_engine.hpp>
+#include <sirius_interface.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -91,6 +94,19 @@ class scan_test_executor : public sirius::parallel::itask_executor {
       });
     }
   }
+};
+
+struct parquet_scan_task_pipeline_fixture {
+  explicit parquet_scan_task_pipeline_fixture(duckdb::ClientContext& ctx)
+    : iface(ctx),
+      engine(ctx, iface),
+      pipeline(duckdb::make_shared_ptr<pipeline::sirius_pipeline>(engine))
+  {
+  }
+
+  sirius_interface iface;
+  sirius_engine engine;
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline;
 };
 
 static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_scan(
@@ -372,8 +388,9 @@ static void run_parquet_scan_test(std::string const& table_name,
     make_parquet_scan(client_ctx, parquet_path.string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    pipeline_fixture.pipeline, physical_scan.get(), batch_size);
 
   cucascade::shared_data_repository data_repo;
 
@@ -470,8 +487,9 @@ static void run_multi_file_parquet_scan_test(
     client_ctx, (parquet_dir / "*.parquet").string(), std::move(projection_indices));
   REQUIRE(physical_scan);
 
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    pipeline_fixture.pipeline, physical_scan.get(), batch_size);
 
   cucascade::shared_data_repository data_repo;
 
@@ -554,8 +572,9 @@ static void run_parquet_scan_test_with_filter(
     client_ctx, parquet_path.string(), std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    pipeline_fixture.pipeline, physical_scan.get(), batch_size);
 
   cucascade::shared_data_repository data_repo;
 
@@ -614,8 +633,9 @@ static size_t count_row_group_partitions(
     client_ctx, parquet_path, std::move(projection_indices), std::move(table_filters));
   REQUIRE(physical_scan);
 
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
   auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
-    nullptr, physical_scan.get(), batch_size);
+    pipeline_fixture.pipeline, physical_scan.get(), batch_size);
   return global_state->get_num_row_group_partitions();
 }
 
@@ -660,6 +680,46 @@ static void run_row_group_pruning_test(std::string const& table_name,
 //------------------------------------------------------------------------------//
 // Test cases
 //------------------------------------------------------------------------------//
+
+TEST_CASE("parquet_scan_task - sirius_read_parquet reads uri from parameters",
+          "[parquet_scan_task][sirius_read_parquet][shared_context]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+
+  create_synthetic_table(con, "sirius_read_parquet_param", 1000);
+  auto parquet_path = write_parquet_from_table(con, "sirius_read_parquet_param", 250);
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  auto physical_scan = make_parquet_scan(client_ctx, parquet_path.string());
+  REQUIRE(physical_scan);
+  physical_scan->function.name = "sirius_read_parquet";
+  physical_scan->bind_data.reset();
+  physical_scan->parameters.clear();
+  physical_scan->parameters.emplace_back(parquet_path.string());
+
+  parquet_scan_task_pipeline_fixture pipeline_fixture(client_ctx);
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    pipeline_fixture.pipeline, physical_scan.get(), 1024 * 1024);
+
+  REQUIRE(global_state->get_file_path(0) == parquet_path.string());
+  REQUIRE(global_state->get_num_row_group_partitions() > 0);
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+
+  auto drop_result = con.Query("DROP TABLE sirius_read_parquet_param");
+  REQUIRE(drop_result);
+  REQUIRE(!drop_result->HasError());
+  std::filesystem::remove(parquet_path);
+}
 
 TEST_CASE("parquet_scan_task - single threaded small table",
           "[parquet_scan_task][single_thread][shared_context]")

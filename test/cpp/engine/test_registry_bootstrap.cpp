@@ -25,6 +25,7 @@
 #include "io/datasource_factory.hpp"
 #include "io/types.hpp"
 #include "io/uring/uring_ioctx.hpp"
+#include "sirius_config.hpp"
 #include "sirius_engine.hpp"
 #include "sirius_interface.hpp"
 
@@ -110,4 +111,17 @@ TEST_CASE("sirius_engine destruction releases ioctx cleanly", "[engine]")
   // Engine is destroyed; the registry dropped its shared_ptr, so only our
   // local reference should remain alive.
   CHECK(ctx_ref.use_count() == 1);
+}
+
+TEST_CASE("sirius_engine config falls back when SiriusContext is absent", "[engine]")
+{
+  auto fx = try_make_engine();
+  if (!fx.engine) {
+    SUCCEED("Skipping: io_uring not supported on this runner");
+    return;
+  }
+
+  REQUIRE_NOTHROW(fx.engine->config());
+  auto const& cfg = fx.engine->config();
+  CHECK(cfg.get_object_store_config().endpoint.empty());
 }
