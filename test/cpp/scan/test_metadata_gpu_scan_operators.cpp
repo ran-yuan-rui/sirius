@@ -227,7 +227,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     if (!input) { break; }
     auto output = metadata_op.execute(*input, stream);
     REQUIRE(output);
-    gpu_op.sink(*output, stream);
+    metadata_op.sink(*output, stream);
   }
 
   // --- Pipeline 1 → Pipeline 2 transition ---
