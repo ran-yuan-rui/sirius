@@ -744,11 +744,11 @@ TEST_CASE("gpu_scan_operator - sink and finalize lifecycle", "[gpu_scan_operator
   auto sirius_types = sirius::from_duckdb_vec(types);
   sirius::op::scan::sirius_gpu_parquet_scan_operator op(sirius_types, 0);
 
-  REQUIRE(op.is_sink());
+  REQUIRE_FALSE(op.is_sink());
   REQUIRE(op.is_source());
 
-  // Before finalization, source methods should indicate not ready.
-  REQUIRE_FALSE(op.all_ports_empty());
+  // With no accumulated metadata, no partition is currently claimable.
+  REQUIRE(op.all_ports_empty());
   REQUIRE(op.get_next_task_hint() == std::nullopt);
   REQUIRE(op.get_next_task_input_data() == nullptr);
 
