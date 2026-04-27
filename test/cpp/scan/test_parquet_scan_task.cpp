@@ -53,8 +53,12 @@
 
 // standard library
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <exception>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -81,6 +85,23 @@ class scan_test_executor : public sirius::parallel::itask_executor {
   {
   }
 
+  [[nodiscard]] size_t completed_tasks() const
+  {
+    return _completed_tasks.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] bool has_worker_exception() const
+  {
+    std::lock_guard<std::mutex> lock(_exception_mutex);
+    return _worker_exception != nullptr;
+  }
+
+  void rethrow_worker_exception() const
+  {
+    std::lock_guard<std::mutex> lock(_exception_mutex);
+    if (_worker_exception) { std::rethrow_exception(_worker_exception); }
+  }
+
  protected:
   void manager_loop() override
   {
@@ -89,12 +110,39 @@ class scan_test_executor : public sirius::parallel::itask_executor {
       if (!slot) { break; }
       auto task = _task_queue.pop();
       if (!task) { break; }
-      _bounded_pool->dispatch(std::move(slot), [t = std::move(task)]() mutable {
-        t->execute(cudf::get_default_stream());
+      _bounded_pool->dispatch(std::move(slot), [this, t = std::move(task)]() mutable {
+        try {
+          t->execute(cudf::get_default_stream());
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(_exception_mutex);
+          if (!_worker_exception) { _worker_exception = std::current_exception(); }
+        }
+        _completed_tasks.fetch_add(1, std::memory_order_release);
       });
     }
   }
+
+ private:
+  std::atomic<size_t> _completed_tasks{0};
+  mutable std::mutex _exception_mutex;
+  std::exception_ptr _worker_exception;
 };
+
+static void wait_for_scan_tasks(scan_test_executor& executor, size_t scheduled)
+{
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+  while (executor.completed_tasks() < scheduled) {
+    if (executor.has_worker_exception()) { break; }
+    if (std::chrono::steady_clock::now() >= deadline) { break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  executor.stop();
+  executor.rethrow_worker_exception();
+  if (executor.completed_tasks() != scheduled) {
+    FAIL("Timed out waiting for parquet scan tasks to finish");
+  }
+}
 
 struct parquet_scan_task_pipeline_fixture {
   explicit parquet_scan_task_pipeline_fixture(duckdb::ClientContext& ctx)
@@ -415,11 +463,7 @@ static void run_parquet_scan_test(std::string const& table_name,
       executor.schedule(std::move(task));
       ++scheduled;
     }
-    while (data_repo.total_size() < scheduled) {
-      std::this_thread::yield();
-    }
-
-    executor.stop();
+    wait_for_scan_tasks(executor, scheduled);
     auto batches = drain_data_repo(data_repo);
     REQUIRE(batches.size() == scheduled);
     return batches;
@@ -514,11 +558,7 @@ static void run_multi_file_parquet_scan_test(
       executor.schedule(std::move(task));
       ++scheduled;
     }
-    while (data_repo.total_size() < scheduled) {
-      std::this_thread::yield();
-    }
-
-    executor.stop();
+    wait_for_scan_tasks(executor, scheduled);
     auto batches = drain_data_repo(data_repo);
     REQUIRE(batches.size() == scheduled);
     return batches;
@@ -599,11 +639,7 @@ static void run_parquet_scan_test_with_filter(
       executor.schedule(std::move(task));
       ++scheduled;
     }
-    while (data_repo.total_size() < scheduled) {
-      std::this_thread::yield();
-    }
-
-    executor.stop();
+    wait_for_scan_tasks(executor, scheduled);
     auto batches = drain_data_repo(data_repo);
     REQUIRE(batches.size() == scheduled);
     return batches;
