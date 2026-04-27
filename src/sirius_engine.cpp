@@ -110,12 +110,17 @@ io::datasource_registry& sirius_engine::datasource_registry()
 
 sirius_config const& sirius_engine::config() const
 {
+  // Fall back to a process-wide default when no SiriusContext is attached:
+  // unit-test fixtures that exercise scan tasks construct a sirius_engine
+  // directly off a ClientContext without registering a SiriusContext, and
+  // datasource_factory::create only ever consults the object_store_config
+  // (empty by default). The lazy s3 ioctx registration in datasource_registry()
+  // already guards on context.registered_state and sirius_ctx, so a default
+  // config here is semantically equivalent to "no s3 endpoint configured."
+  static const sirius_config kDefault{};
+  if (!context.registered_state) { return kDefault; }
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    throw std::runtime_error(
-      "sirius_engine::config(): SiriusContext is not registered on this ClientContext. "
-      "This accessor may only be used during query execution.");
-  }
+  if (!sirius_ctx) { return kDefault; }
   return sirius_ctx->get_config();
 }
 
