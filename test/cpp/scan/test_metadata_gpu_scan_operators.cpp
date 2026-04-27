@@ -198,7 +198,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
   duckdb::vector<duckdb::idx_t> projection_ids,
   duckdb::vector<std::string> names,
   std::size_t approximate_batch_size,
-  cucascade::memory::memory_space&,
+  cucascade::memory::memory_space& gpu_space,
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr,
   rmm::cuda_stream_view stream                             = cudf::get_default_stream())
 {
@@ -240,6 +240,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> run_two_pipeline_scan(
     if (!hint) { break; }
     auto input = gpu_op.get_next_task_input_data();
     if (!input) { break; }
+    auto handles = input->prepare_for_processing(&gpu_space, stream);
+    REQUIRE(handles.has_value());
     auto output = gpu_op.execute(*input, stream);
     REQUIRE(output);
     auto* pipelineable = dynamic_cast<sirius::op::pipelineable_operator_data*>(output.get());
