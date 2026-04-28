@@ -44,10 +44,38 @@ static fs::path get_project_root()
 struct sirius_config_env_guard {
   explicit sirius_config_env_guard(std::string const& config_path)
   {
+    if (auto const* current = std::getenv("SIRIUS_CONFIG_FILE")) {
+      had_config_env = true;
+      config_env     = current;
+    }
+    if (auto const* current = std::getenv("SIRIUS_DISABLE")) {
+      had_disable_env = true;
+      disable_env     = current;
+    }
+
+    unsetenv("SIRIUS_DISABLE");
     setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
   }
 
-  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
+  ~sirius_config_env_guard()
+  {
+    if (had_config_env) {
+      setenv("SIRIUS_CONFIG_FILE", config_env.c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_CONFIG_FILE");
+    }
+
+    if (had_disable_env) {
+      setenv("SIRIUS_DISABLE", disable_env.c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_DISABLE");
+    }
+  }
+
+  bool had_config_env{false};
+  bool had_disable_env{false};
+  std::string config_env;
+  std::string disable_env;
 };
 
 struct env_cfg {
@@ -232,9 +260,11 @@ class s3_gpu_execution_fixture {
 
 }  // namespace
 
+// Keep expected-error cases out of the shared integration DB: DuckDB may mark
+// the database invalid after the table function surfaces these runtime errors.
 TEST_CASE_METHOD(s3_gpu_execution_fixture,
                  "gpu_execution s3 - missing object surfaces query error",
-                 "[integration][gpu_execution][s3][parquet]")
+                 "[integration][gpu_execution][s3][parquet][isolated_context]")
 {
   auto cfg = read_env();
   if (skip_if_env_missing(cfg)) return;
@@ -250,7 +280,7 @@ TEST_CASE_METHOD(s3_gpu_execution_fixture,
 
 TEST_CASE_METHOD(s3_gpu_execution_fixture,
                  "gpu_execution s3 - bad credentials surface query error",
-                 "[integration][gpu_execution][s3][parquet]")
+                 "[integration][gpu_execution][s3][parquet][isolated_context]")
 {
   auto cfg = read_env();
   if (skip_if_env_missing(cfg)) return;
