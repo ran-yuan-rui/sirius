@@ -56,8 +56,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -116,8 +116,8 @@ class scan_test_watchdog {
 
       auto phase = _phase;
       lock.unlock();
-      std::cerr << "[parquet_scan_task_test] timed out after " << _timeout.count()
-                << "s while " << phase << std::endl;
+      std::cerr << "[parquet_scan_task_test] timed out after " << _timeout.count() << "s while "
+                << phase << std::endl;
       std::abort();
     }
   }

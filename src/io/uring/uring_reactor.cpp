@@ -290,14 +290,29 @@ void uring_reactor::worker_loop()
   };
 
   while (true) {
+    // Always drain the moodycamel queues into local dequeues BEFORE checking
+    // has_active() — the dequeues are the only state has_active() looks at.
+    // Without this, a producer that enqueued + bumped wake_seq before our
+    // seq.load() will leave work sitting invisible in the moodycamel queue,
+    // and we'll park on seq=current_value and never wake.
+    drain_queue();
+
     if (!has_active()) {
       if (_stop.load(std::memory_order_acquire)) break;
       uint64_t seq = _wake_seq.load(std::memory_order_acquire);
       if (!has_active()) _wake_seq.wait(seq, std::memory_order_relaxed);
+      // Re-drain AFTER the seq load.  Any producer whose enqueue is now
+      // observable either (a) landed before our load and is pulled in here,
+      // making has_active() true, or (b) landed after our load, in which
+      // case their fetch_add(1) made wake_seq != seq so the wait below
+      // returns immediately.  Either way, no lost wake-up.
+      drain_queue();
+      if (!has_active()) { _wake_seq.wait(seq, std::memory_order_relaxed); }
       if (_stop.load(std::memory_order_acquire)) break;
+      // Pull whatever work woke us up before the main body runs.
+      drain_queue();
     }
 
-    drain_queue();
     submit_pending();
 
     if (inflight > 0) {

@@ -2775,8 +2775,8 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
       auto const& gpu_val = gpu_rows[r].cells[c];
       auto const& cpu_val = cpu_rows[r].cells[c];
       if (gpu_val.is_null != cpu_val.is_null) {
-        UNSCOPED_INFO("Row " << r << " Col " << c << " nullability mismatch: GPU=["
-                             << gpu_val.text << "] CPU=[" << cpu_val.text << "]");
+        UNSCOPED_INFO("Row " << r << " Col " << c << " nullability mismatch: GPU=[" << gpu_val.text
+                             << "] CPU=[" << cpu_val.text << "]");
       }
       REQUIRE(gpu_val.is_null == cpu_val.is_null);
       if (gpu_val.text != cpu_val.text) {
@@ -2828,8 +2828,8 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
       auto const& gpu_val = gpu_rows[r].cells[c];
       auto const& cpu_val = cpu_rows[r].cells[c];
       if (gpu_val.is_null != cpu_val.is_null) {
-        UNSCOPED_INFO("Row " << r << " Col " << c << " nullability mismatch: GPU=["
-                             << gpu_val.text << "] CPU=[" << cpu_val.text << "]");
+        UNSCOPED_INFO("Row " << r << " Col " << c << " nullability mismatch: GPU=[" << gpu_val.text
+                             << "] CPU=[" << cpu_val.text << "]");
       }
       REQUIRE(gpu_val.is_null == cpu_val.is_null);
       if (gpu_val.text != cpu_val.text) {
