@@ -213,7 +213,7 @@ class s3_gpu_execution_fixture {
     // below proves the plain CPU s3:// path is unavailable in the same
     // connection, so success here must be coming from Sirius's own S3
     // datasource path rather than DuckDB's native remote I/O.
-    return con->Query("SELECT * FROM gpu_execution(\"" + inner_sql + "\")");
+    return con->Query("CALL gpu_execution(\"" + inner_sql + "\")");
   }
 
   void require_ok(std::string const& sql)
