@@ -189,17 +189,28 @@ void sirius_pipeline_converter::split_parquet_scan_source(
 {
   auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
 
-  // Extract file paths from the DuckDB scan's bind data.
-  auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
-  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
-    throw std::runtime_error(
-      "[sirius_pipeline_converter::split_parquet_scan_source] No input files to scan");
-  }
   std::vector<std::string> file_paths;
-  for (auto const& file : bind_data.file_list->GetAllFiles()) {
-    file_paths.push_back(file.path);
+  duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
+  // sirius_read_parquet binds only schema and stores the S3 URI in parameters,
+  // so it has no MultiFileBindData to read here.
+  if (scan_op.function.name == "sirius_read_parquet") {
+    if (scan_op.parameters.empty()) {
+      throw std::runtime_error(
+        "[sirius_pipeline_converter::split_parquet_scan_source] sirius_read_parquet scan is "
+        "missing input parameters");
+    }
+    file_paths.push_back(scan_op.parameters.front().GetValue<std::string>());
+  } else {
+    auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+      throw std::runtime_error(
+        "[sirius_pipeline_converter::split_parquet_scan_source] No input files to scan");
+    }
+    for (auto const& file : bind_data.file_list->GetAllFiles()) {
+      file_paths.push_back(file.path);
+    }
+    partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
   }
-  auto const& partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
 
   // Construct the pair. metadata_scan_op holds a raw pointer back to gpu_scan_op for the direct
   // accumulate_metadata() / finalize_partitions() handoff.
