@@ -105,23 +105,38 @@ class datasource_registry {
 class datasource_factory {
  public:
   /**
-   * @brief Create an @c io_datasource for @p uri.
+   * @brief Create a @c cudf::io::datasource for @p uri.
+   *
+   * Dispatch:
+   *   - Local file paths (@c "/data/foo.parquet", @c "file:///data/foo.parquet")
+   *     return cudf's default datasource (@c cudf::io::datasource::create) —
+   *     pre-PR3 baseline. The registry is not consulted for file scheme.
+   *   - Object-store schemes (@c s3://, etc.) go through the registry → ioctx
+   *     and produce a @c sirius_datasource (which is an @c io_datasource and
+   *     thus also a @c cudf::io::datasource). Callers that need the extended
+   *     @c io_datasource API must @c dynamic_cast — or, for s3-only paths,
+   *     call the ioctx directly.
+   *
+   * The wider return type is deliberate: it lets the file branch keep using
+   * cudf's proven default reader without forcing a sirius-specific adapter,
+   * which sidesteps regression risk on the local-parquet hot path until a
+   * GDS-aware backend (PR6) makes the switch worthwhile.
    *
    * @param uri      The resource URI (e.g. @c "/data/file.parquet",
    *                 @c "file:///data/file.parquet", @c "s3://bucket/key").
-   * @param registry Registry to look up the backend ioctx.
+   * @param registry Registry to look up the backend ioctx (object-store schemes only).
    * @param config   Engine config (read by object-store backends in later PRs).
    *
    * @return A new datasource on success.
    *
    * @throw std::invalid_argument if the URI is empty or malformed.
-   * @throw std::runtime_error    if no backend is registered for the scheme,
-   *                              or if the backend's @c make_datasource does
-   *                              not produce an @c io_datasource.
+   * @throw std::runtime_error    if an object-store scheme has no backend
+   *                              registered, or if the backend's
+   *                              @c make_datasource fails.
    */
-  static std::unique_ptr<io_datasource> create(std::string_view uri,
-                                               datasource_registry const& registry,
-                                               sirius_config const& config);
+  static std::unique_ptr<cudf::io::datasource> create(std::string_view uri,
+                                                      datasource_registry const& registry,
+                                                      sirius_config const& config);
 
   /**
    * @brief Extract the URI scheme. Thin shim over @c sirius::io::parse.

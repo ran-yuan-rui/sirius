@@ -19,8 +19,9 @@
 #include "io/s3/s3_io_object.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/uri_parser.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "sirius_config.hpp"
+
+#include <cudf/io/datasource.hpp>
 
 #include <stdexcept>
 #include <utility>
@@ -79,23 +80,27 @@ std::string datasource_factory::extract_scheme(std::string_view uri) { return pa
 
 std::string datasource_factory::extract_path(std::string_view uri) { return parse(uri).path; }
 
-std::unique_ptr<io_datasource> datasource_factory::create(std::string_view uri,
-                                                          datasource_registry const& registry,
-                                                          sirius_config const& /*config*/)
+std::unique_ptr<cudf::io::datasource> datasource_factory::create(
+  std::string_view uri, datasource_registry const& registry, sirius_config const& /*config*/)
 {
-  auto p     = parse(uri);
+  auto p = parse(uri);
+
+  // Local file paths stay on cudf's default pread-based datasource. This
+  // matches the pre-PR3 baseline and sidesteps the new IO framework for the
+  // hot path that 99% of queries hit. A future PR (e.g. gds_ioctx) can opt
+  // local NVMe paths into a sirius-managed backend via a SET knob without
+  // touching the call sites.
+  if (p.scheme == kFileScheme) { return cudf::io::datasource::create(std::move(p.path)); }
+
+  // Object-store schemes go through the registry → ioctx → sirius_datasource.
   auto ioctx = registry.lookup(p.scheme);
   if (!ioctx) {
     throw std::runtime_error("datasource_factory: no backend registered for scheme '" + p.scheme +
                              "' (uri=" + std::string{uri} + ")");
   }
 
-  // Per-scheme io_object construction. gds (PR6) and rdma_s3 (PR10) land
-  // later; until then, their schemes can be registered but not constructed.
   std::unique_ptr<sirius_io_object> io_object;
-  if (p.scheme == kFileScheme) {
-    io_object = std::make_unique<uring_io_object>(std::move(p.path));
-  } else if (p.scheme == kS3Scheme) {
+  if (p.scheme == kS3Scheme) {
     // s3://bucket/key — host carries the bucket, path carries the key.
     if (p.host.empty()) throw std::invalid_argument("datasource_factory: s3 URI missing bucket");
     auto* s3_ctx = dynamic_cast<s3::s3_ioctx*>(ioctx.get());
@@ -108,14 +113,7 @@ std::unique_ptr<io_datasource> datasource_factory::create(std::string_view uri,
                              "' is registered but object construction is not yet implemented");
   }
 
-  auto ds     = ioctx->make_datasource(std::move(io_object));
-  auto* io_ds = dynamic_cast<io_datasource*>(ds.get());
-  if (!io_ds) {
-    throw std::runtime_error("datasource_factory: ioctx for '" + p.scheme +
-                             "' returned a non-io_datasource");
-  }
-  (void)ds.release();
-  return std::unique_ptr<io_datasource>{io_ds};
+  return ioctx->make_datasource(std::move(io_object));
 }
 
 }  // namespace sirius::io

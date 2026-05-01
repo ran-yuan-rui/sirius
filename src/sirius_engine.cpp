@@ -21,7 +21,6 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/datasource_factory.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -64,9 +63,10 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
     sirius_iface(sirius_iface),
     datasource_registry_(std::make_shared<io::datasource_registry>())
 {
-  // Register the default local-file backend (io_uring + O_DIRECT).
-  // Reactor tuning lives in PR13 (sirius_config::uring_config).
-  datasource_registry_->register_ioctx("file", std::make_shared<io::uring_ioctx>());
+  // No eager backends: local file paths bypass the registry entirely
+  // (datasource_factory routes them to cudf's default datasource), and
+  // object-store backends (s3) are registered lazily on first
+  // datasource_registry() access once SiriusContext is attached.
 }
 
 sirius_engine::~sirius_engine()
