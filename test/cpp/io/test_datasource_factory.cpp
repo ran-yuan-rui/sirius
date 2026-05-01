@@ -16,11 +16,8 @@
 
 #include "catch.hpp"
 #include "io/datasource_factory.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "sirius_config.hpp"
 
-#include <fcntl.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -32,7 +29,6 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <future>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -155,22 +151,6 @@ class scoped_temp_file {
   std::string _path;
 };
 
-// Attempt to build a uring_ioctx; if the runtime doesn't support io_uring (or
-// the user lacks the capability), returns nullptr so the caller can skip.
-std::shared_ptr<uring_ioctx> try_make_uring_ioctx()
-{
-  try {
-    // Small footprint for tests: 2 host rings, 8 entries, 1 reactor.
-    return std::make_shared<uring_ioctx>(/*host_ring_depth=*/2,
-                                         /*ring_entries=*/8,
-                                         /*n_reactors=*/1,
-                                         /*bounce_slot_size=*/1UL << 20);
-  } catch (std::exception const& e) {
-    WARN("uring_ioctx construction failed: " << e.what());
-    return nullptr;
-  }
-}
-
 }  // namespace
 
 // ===========================================================================
@@ -277,12 +257,12 @@ TEST_CASE("datasource_factory::create — empty URI rejected", "[datasource_fact
   CHECK_THROWS_AS(datasource_factory::create("", reg, cfg), std::invalid_argument);
 }
 
-TEST_CASE("datasource_factory::create — throws when scheme unregistered", "[datasource_factory]")
+TEST_CASE("datasource_factory::create — throws when object-store scheme unregistered",
+          "[datasource_factory]")
 {
   datasource_registry reg;
   sirius_config cfg;
   CHECK_THROWS_AS(datasource_factory::create("s3://bucket/key", reg, cfg), std::runtime_error);
-  CHECK_THROWS_AS(datasource_factory::create("/data/file.parquet", reg, cfg), std::runtime_error);
 }
 
 TEST_CASE("datasource_factory::create — s3 scheme requires an s3_ioctx", "[datasource_factory]")
@@ -304,43 +284,28 @@ TEST_CASE("datasource_factory::create — s3 scheme requires an s3_ioctx", "[dat
 }
 
 // ===========================================================================
-// datasource_factory::create — happy path with a real uring_ioctx
+// datasource_factory::create — happy path with cudf default datasource
 // ===========================================================================
 
-TEST_CASE("datasource_factory::create — dispatches file:// to uring_ioctx", "[datasource_factory]")
+TEST_CASE("datasource_factory::create — local file uses cudf default datasource",
+          "[datasource_factory]")
 {
-  auto ctx = try_make_uring_ioctx();
-  if (!ctx) {
-    SUCCEED("Skipping: io_uring not supported on this runner");
-    return;
-  }
-
-  scoped_temp_file tmp("hello sirius");
+  constexpr std::string_view expected{"hello sirius"};
+  scoped_temp_file tmp(expected);
   datasource_registry reg;
-  reg.register_ioctx("file", ctx);
   sirius_config cfg;
 
-  std::unique_ptr<io_datasource> ds;
-  try {
-    ds = datasource_factory::create(tmp.path(), reg, cfg);
-  } catch (std::exception const& e) {
-    // Some sandboxes (e.g. tmpfs) reject O_DIRECT. That's a runtime
-    // capability, not a factory defect.
-    WARN(
-      "uring_io_object could not open temp file (likely no O_DIRECT "
-      "support): "
-      << e.what());
-    SUCCEED("Skipping: filesystem does not support O_DIRECT");
-    return;
-  }
-
+  auto ds = datasource_factory::create(tmp.path(), reg, cfg);
   REQUIRE(ds != nullptr);
-  CHECK(ds->size() == std::string_view{"hello sirius"}.size());
+  CHECK(ds->size() == expected.size());
+
+  auto buf = ds->host_read(0, expected.size());
+  REQUIRE(buf != nullptr);
+  REQUIRE(buf->size() == expected.size());
+  CHECK(std::memcmp(buf->data(), expected.data(), expected.size()) == 0);
 
   // file:// form must produce an equivalent datasource.
   auto ds2 = datasource_factory::create("file://" + tmp.path(), reg, cfg);
   REQUIRE(ds2 != nullptr);
   CHECK(ds2->size() == ds->size());
-
-  ctx->shutdown();
 }

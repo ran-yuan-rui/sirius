@@ -14,14 +14,8 @@
  * limitations under the License.
  */
 
-// IMPORTANT: include order matters. liburing.h (pulled in transitively by
-// io/uring/uring_ioctx.hpp) defines BLOCK_SIZE as a preprocessor macro that
-// collides with duckdb concurrentqueue's BLOCK_SIZE identifier. Include all
-// duckdb headers BEFORE the uring headers.
 #include "catch.hpp"
 #include "io/datasource_factory.hpp"
-#include "io/types.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "sirius_config.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -31,17 +25,13 @@
 
 #include <cerrno>
 #include <cstring>
-#include <exception>
 #include <filesystem>
 #include <memory>
-#include <stdexcept>
 #include <string>
 
 using sirius::sirius_config;
 using sirius::io::datasource_factory;
 using sirius::io::datasource_registry;
-using sirius::io::io_datasource;
-using sirius::io::uring_ioctx;
 
 namespace {
 
@@ -79,36 +69,13 @@ struct scoped_parquet_file {
   }
 };
 
-// Construct a small uring_ioctx for tests; returns nullptr if io_uring is
-// unavailable so callers can skip gracefully on CI runners without kernel
-// support.
-std::shared_ptr<uring_ioctx> try_make_uring_ioctx()
-{
-  try {
-    return std::make_shared<uring_ioctx>(/*host_ring_depth=*/2,
-                                         /*ring_entries=*/8,
-                                         /*n_reactors=*/1,
-                                         /*bounce_slot_size=*/1UL << 20);
-  } catch (std::exception const& e) {
-    WARN("uring_ioctx construction failed: " << e.what());
-    return nullptr;
-  }
-}
-
 }  // namespace
 
 TEST_CASE("scan_local_parquet_via_factory_equivalent_to_cudf_direct", "[parquet_scan]")
 {
-  auto ctx = try_make_uring_ioctx();
-  if (!ctx) {
-    SUCCEED("Skipping: io_uring not supported on this runner");
-    return;
-  }
-
   scoped_parquet_file file{write_tiny_parquet("equivalence", /*num_rows=*/128)};
 
   datasource_registry reg;
-  reg.register_ioctx("file", ctx);
   sirius_config cfg;
 
   // Reference path: cudf's default local-file datasource.
@@ -116,16 +83,9 @@ TEST_CASE("scan_local_parquet_via_factory_equivalent_to_cudf_direct", "[parquet_
   auto const n_bytes = ds_direct->size();
   REQUIRE(n_bytes > 0);
 
-  // Path under test: the sirius factory.  The default "file" handler goes
-  // through uring_ioctx + uring_io_object + sirius_datasource.
-  std::unique_ptr<io_datasource> ds_factory;
-  try {
-    ds_factory = datasource_factory::create(file.path.string(), reg, cfg);
-  } catch (std::exception const& e) {
-    WARN("datasource_factory::create threw: " << e.what());
-    SUCCEED("Skipping: factory path unavailable at runtime");
-    return;
-  }
+  // Path under test: local files bypass the registry and use cudf's default
+  // local-file datasource.
+  auto ds_factory = datasource_factory::create(file.path.string(), reg, cfg);
 
   REQUIRE(ds_factory != nullptr);
   REQUIRE(ds_factory->size() == n_bytes);
@@ -155,14 +115,7 @@ TEST_CASE("scan_local_parquet_via_factory_equivalent_to_cudf_direct", "[parquet_
 
 TEST_CASE("scan_handles_missing_file_via_factory_error_path", "[parquet_scan]")
 {
-  auto ctx = try_make_uring_ioctx();
-  if (!ctx) {
-    SUCCEED("Skipping: io_uring not supported on this runner");
-    return;
-  }
-
   datasource_registry reg;
-  reg.register_ioctx("file", ctx);
   sirius_config cfg;
 
   auto missing =
@@ -170,5 +123,5 @@ TEST_CASE("scan_handles_missing_file_via_factory_error_path", "[parquet_scan]")
   std::error_code ec;
   std::filesystem::remove(missing, ec);  // make doubly sure it doesn't exist
 
-  CHECK_THROWS_AS(datasource_factory::create(missing.string(), reg, cfg), std::runtime_error);
+  CHECK_THROWS(datasource_factory::create(missing.string(), reg, cfg));
 }

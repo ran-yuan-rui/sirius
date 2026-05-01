@@ -30,7 +30,6 @@
 
 using sirius::io::datasource_factory;
 using sirius::io::datasource_registry;
-using sirius::io::io_datasource;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 
@@ -153,7 +152,7 @@ TEST_CASE("datasource_factory: end-to-end s3:// via live endpoint", "[s3][ioctx]
   reg.register_ioctx("s3", make_ctx(e));
   sirius::sirius_config cfg;
 
-  std::unique_ptr<io_datasource> ds;
+  std::unique_ptr<cudf::io::datasource> ds;
   try {
     ds = datasource_factory::create("s3://" + e.bucket + "/" + e.key, reg, cfg);
   } catch (std::exception const& ex) {

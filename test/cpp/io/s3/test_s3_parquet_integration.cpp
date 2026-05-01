@@ -62,7 +62,6 @@
 using sirius::sirius_config;
 using sirius::io::datasource_factory;
 using sirius::io::datasource_registry;
-using sirius::io::io_datasource;
 using sirius::io::s3::s3_ioctx;
 using sirius::io::s3::s3_ioctx_config;
 
@@ -150,7 +149,7 @@ TEST_CASE("s3_parquet_integration: read_parquet end-to-end through sirius s3 pip
   reg.register_ioctx("s3", make_ctx(e));
   sirius_config cfg;
 
-  std::unique_ptr<io_datasource> ds;
+  std::unique_ptr<cudf::io::datasource> ds;
   try {
     ds = datasource_factory::create("s3://" + e.bucket + "/parquet/nation.parquet", reg, cfg);
   } catch (std::exception const& ex) {

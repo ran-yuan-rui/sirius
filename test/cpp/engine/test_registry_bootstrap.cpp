@@ -14,17 +14,10 @@
  * limitations under the License.
  */
 
-// IMPORTANT: include order matters here. liburing.h (pulled in transitively
-// by io/uring/uring_ioctx.hpp) defines BLOCK_SIZE as a preprocessor macro,
-// which collides with duckdb concurrentqueue's BLOCK_SIZE identifier. Include
-// all duckdb headers (and anything that pulls them in) BEFORE the uring
-// headers.
 #include "catch.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "io/datasource_factory.hpp"
-#include "io/types.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "sirius_config.hpp"
 #include "sirius_engine.hpp"
 #include "sirius_interface.hpp"
@@ -35,9 +28,6 @@
 
 using sirius::sirius_engine;
 using sirius::sirius_interface;
-using sirius::io::datasource_registry;
-using sirius::io::sirius_ioctx;
-using sirius::io::uring_ioctx;
 
 namespace {
 
@@ -48,9 +38,8 @@ struct engine_fixture {
   std::unique_ptr<sirius_engine> engine;
 };
 
-// Stand up a minimal engine; returns an empty fixture (engine==nullptr) when
-// the runtime does not support io_uring — the engine ctor constructs a
-// uring_ioctx by default, which requires the kernel capability.
+// Stand up a minimal engine; returns an empty fixture (engine==nullptr) if
+// bootstrap fails before the assertions under test.
 engine_fixture try_make_engine()
 {
   engine_fixture fx;
@@ -69,55 +58,41 @@ engine_fixture try_make_engine()
 
 }  // namespace
 
-TEST_CASE("sirius_engine bootstrap populates registry with uring_ioctx", "[engine]")
+TEST_CASE("sirius_engine bootstrap leaves file scheme on cudf default datasource", "[engine]")
 {
   auto fx = try_make_engine();
   if (!fx.engine) {
-    SUCCEED("Skipping: io_uring not supported on this runner");
+    SUCCEED("Skipping: sirius_engine bootstrap failed on this runner");
     return;
   }
 
   auto& reg = fx.engine->datasource_registry();
 
-  // "file" is the one scheme registered by default in PR2.
-  auto ctx = reg.lookup("file");
-  REQUIRE(ctx != nullptr);
-  CHECK(dynamic_cast<uring_ioctx*>(ctx.get()) != nullptr);
-
-  auto schemes = reg.schemes();
-  REQUIRE(schemes.size() == 1);
-  CHECK(schemes.front() == "file");
-
-  // Unregistered schemes still return nullptr.
+  // Local files bypass the registry and use cudf's default datasource.
+  CHECK(reg.lookup("file") == nullptr);
   CHECK(reg.lookup("s3") == nullptr);
+  CHECK(reg.schemes().empty());
 }
 
-TEST_CASE("sirius_engine destruction releases ioctx cleanly", "[engine]")
+TEST_CASE("sirius_engine destruction handles empty datasource registry", "[engine]")
 {
-  std::shared_ptr<sirius_ioctx> ctx_ref;
-
   {
     auto fx = try_make_engine();
     if (!fx.engine) {
-      SUCCEED("Skipping: io_uring not supported on this runner");
+      SUCCEED("Skipping: sirius_engine bootstrap failed on this runner");
       return;
     }
-    ctx_ref = fx.engine->datasource_registry().lookup("file");
-    REQUIRE(ctx_ref != nullptr);
-    // Engine's registry + our local ref -> at least 2 strong refs.
-    CHECK(ctx_ref.use_count() >= 2);
+    CHECK(fx.engine->datasource_registry().schemes().empty());
   }
 
-  // Engine is destroyed; the registry dropped its shared_ptr, so only our
-  // local reference should remain alive.
-  CHECK(ctx_ref.use_count() == 1);
+  SUCCEED("sirius_engine destroyed with no default file ioctx registered");
 }
 
 TEST_CASE("sirius_engine config falls back when SiriusContext is absent", "[engine]")
 {
   auto fx = try_make_engine();
   if (!fx.engine) {
-    SUCCEED("Skipping: io_uring not supported on this runner");
+    SUCCEED("Skipping: sirius_engine bootstrap failed on this runner");
     return;
   }
 
