@@ -86,7 +86,7 @@ inline cucascade::memory::memory_space* get_default_gpu_space()
 }
 inline rmm::device_async_resource_ref get_resource_ref(cucascade::memory::memory_space& space)
 {
-  return rmm::to_device_async_resource_ref_checked(space.get_default_allocator());
+  return space.get_default_allocator();
 }
 
 inline rmm::cuda_stream_view default_stream() { return cudf::get_default_stream(); }
@@ -114,8 +114,8 @@ inline std::shared_ptr<cucascade::data_batch> concatenate_batches_horizontal(
   std::vector<std::unique_ptr<cudf::column>> all_columns;
 
   for (const auto& batch : batches) {
-    auto& table     = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto table_view = table.view();
+    auto table_view =
+      batch->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
 
     // Release and collect each column from this table
     for (cudf::size_type i = 0; i < table_view.num_columns(); ++i) {

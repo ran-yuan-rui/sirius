@@ -15,10 +15,10 @@
  */
 
 // sirius
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/regex/regex_playground.hpp>
-#include <operator/gpu_physical_strings_matching.hpp>
-#include <operator/strlen_from_offsets.cuh>
+#include <sirius/exception.hpp>
 
 // duckdb
 #include <duckdb/common/assert.hpp>
@@ -112,7 +112,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       } else if (function_name == MOD_FUNC_STR) {
         return cudf::ast::ast_operator::MOD;
       } else {
-        throw duckdb::InternalException(
+        throw invalid_input_exception(
           "[gpu_expression_executor:function] unsupported AST function type {}", function_name);
       }
     };
@@ -144,13 +144,17 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   // If the caller requested AST mode but we fell through (unsupported function for AST),
   // materialize the result and wrap it as a temp column for the parent's AST tree.
   if (mode == execution_mode::AST) {
+    // Re-enter execute with MATERIALIZE mode to get the result as a column, then add to the AST
+    // tree.
     auto result = execute(expr, execution_mode::MATERIALIZE);
-    if (result.is_scalar()) {
-      return materialize_as_ast_column(
-        cudf::make_column_from_scalar(result.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    if (!result.is_owned_column()) {
+      // Any function execution in MATERIALIZE mode should produce an owned column. Otherwise,
+      // something went wrong.
+      throw internal_exception(
+        "[gpu_expression_executor:function]: Expected an owned column after executing function "
+        "expression.");
     }
-    return materialize_as_ast_column(
-      std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+    return materialize_as_ast_column(std::move(result.release_column()));
   }
   auto const output_type = GetCudfType(expr.return_type);
 
@@ -205,7 +209,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       cudf::strings::slice_strings(cudf::strings_column_view(input.get_column_view()),
                                    cudf::numeric_scalar(start_val, true, _stream, _mr),
                                    cudf::numeric_scalar(stop_val, true, _stream, _mr),
-                                   1,
+                                   cudf::numeric_scalar<cudf::size_type>(1, true, _stream, _mr),
                                    _stream,
                                    _mr);
     return execute_result(std::move(result_column));
@@ -321,7 +325,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
       } else if (freq_str == "microsecond") {
         return cudf::datetime::rounding_frequency::MICROSECOND;
       } else {
-        throw duckdb::InternalException(
+        throw invalid_input_exception(
           "[gpu_expression_executor:function] unrecognized/unsupported date_trunc frequency: {}",
           freq_str);
       }
@@ -366,7 +370,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
         if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
-          return ::sirius::expression::regex_playground::jit_transform_clickbench_q28_regex(
+          return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
             input.get_column_view());
         }
       }
@@ -408,7 +412,7 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
   }
 
   // If we reach here, it means the function is not supported in the expression executor
-  throw duckdb::NotImplementedException(
+  throw not_implemented_exception(
     "[gpu_expression_executor:function] execute called on unsupported function: %s", func_string);
 }
 

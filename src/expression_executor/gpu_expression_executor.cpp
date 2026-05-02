@@ -17,8 +17,9 @@
 // sirius
 #include <cudf/cudf_utils.hpp>
 
+#include <expression/expression_internal.hpp>
+#include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <operator/gpu_materialize.hpp>
 
 // cucascade
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -27,6 +28,16 @@
 // duckdb
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types.hpp>
+#include <duckdb/planner/expression.hpp>
+#include <duckdb/planner/expression/bound_between_expression.hpp>
+#include <duckdb/planner/expression/bound_case_expression.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -154,16 +165,27 @@ std::unique_ptr<cudf::column> gpu_expression_executor::execute_result::release_c
 //===----------------------------------------------------------------------===//
 
 gpu_expression_executor::gpu_expression_executor(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> const& expressions,
+  duckdb::vector<sirius::expression> const& expressions,
   rmm::device_async_resource_ref resource_ref,
   rmm::cuda_stream_view stream,
   expression_executor_strategy strategy,
   std::size_t min_ast_size)
   : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
 {
+  _expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
-    _expressions.push_back(expr.get());
+    _expressions.push_back(sirius::unwrap(expr));
   }
+}
+
+gpu_expression_executor::gpu_expression_executor(sirius::expression const& expression,
+                                                 rmm::device_async_resource_ref resource_ref,
+                                                 rmm::cuda_stream_view stream,
+                                                 expression_executor_strategy strategy,
+                                                 std::size_t min_ast_size)
+  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+{
+  _expressions.push_back(sirius::unwrap(expression));
 }
 
 gpu_expression_executor::gpu_expression_executor(duckdb::Expression const* expression,
@@ -241,10 +263,8 @@ void gpu_expression_executor::release_temporaries(
   }
 }
 
-std::shared_ptr<data_batch> gpu_expression_executor::execute(
-  std::shared_ptr<data_batch> input_batch)
+std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view input)
 {
-  if (!input_batch) { return input_batch; }
   D_ASSERT(!_expressions.empty());
   _output_columns.clear();
   _output_columns.reserve(_expressions.size());
@@ -256,8 +276,7 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
   _temp_columns.clear();
 
   // Get the table_view from the input_batch
-  auto const& input_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  _input_table          = input_rep.get_table().view();
+  _input_table = std::move(input);
 
   // Execute the expressions and emit results into _output_columns
   for (auto& _expression : _expressions) {
@@ -298,37 +317,21 @@ std::shared_ptr<data_batch> gpu_expression_executor::execute(
     }
   }
 
-  // Create the data representation
-  std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(
-      std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr),
-      *input_batch->get_memory_space());
-
-  // Create the data batch and return
-  auto const batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
+  return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
 }
 
-std::shared_ptr<data_batch> gpu_expression_executor::select(std::shared_ptr<data_batch> input_batch)
+std::unique_ptr<cudf::table> gpu_expression_executor::select(cudf::table_view input)
 {
   D_ASSERT(_expressions.size() == 1);
   auto const& expr = *_expressions[0];
   D_ASSERT(expr.return_type == duckdb::LogicalType::BOOLEAN);
 
   // Call execute(input_batch) to set _input_table and produce the boolean mask as a single column
-  auto mask_batch = execute(input_batch);
-  auto& mask_repr = mask_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  auto mask_view  = mask_repr.get_table().view().column(0);
+  auto mask_batch = execute(input);
+  auto mask_view  = mask_batch->view().column(0);
 
   // Apply the boolean mask to filter the input batch
-  auto output_table = cudf::apply_boolean_mask(_input_table, mask_view, _stream, _mr);
-  std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
-                                                          *input_batch->get_memory_space());
-
-  // Create the data batch and return
-  auto const batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
+  return cudf::apply_boolean_mask(input, mask_view, _stream, _mr);
 }
 
 execute_result gpu_expression_executor::execute(duckdb::Expression const& expr, execution_mode mode)
@@ -436,12 +439,7 @@ std::size_t gpu_expression_executor::count_ast_ops(duckdb::Expression const& exp
           }
           return count;
         }
-        case duckdb::ExpressionType::OPERATOR_COALESCE:
-          /// TODO: Implement COALESCE operator
-          /// GitHub issue ticket: https://github.com/sirius-db/sirius/issues/635
-          throw duckdb::NotImplementedException(
-            "[gpu_expression_executor] count_ast_ops called on an unsupported COALESCE operator "
-            "expression.");
+        case duckdb::ExpressionType::OPERATOR_COALESCE: return 0;
         case duckdb::ExpressionType::OPERATOR_TRY:
           throw duckdb::NotImplementedException(
             "[gpu_expression_executor] count_ast_ops called on an unsupported TRY operator "

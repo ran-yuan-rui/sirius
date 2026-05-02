@@ -99,7 +99,7 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(
                              "' (uri=" + std::string{uri} + ")");
   }
 
-  std::unique_ptr<sirius_io_object> io_object;
+  std::shared_ptr<sirius_io_object> io_object;
   if (p.scheme == kS3Scheme) {
     // s3://bucket/key — host carries the bucket, path carries the key.
     if (p.host.empty()) throw std::invalid_argument("datasource_factory: s3 URI missing bucket");
@@ -107,7 +107,7 @@ std::unique_ptr<cudf::io::datasource> datasource_factory::create(
     if (!s3_ctx)
       throw std::runtime_error("datasource_factory: scheme 's3' registered with non-s3 ioctx");
     auto obj_size = s3_ctx->head_object_size(p.host, p.path);
-    io_object = std::make_unique<s3::s3_io_object>(std::move(p.host), std::move(p.path), obj_size);
+    io_object = std::make_shared<s3::s3_io_object>(std::move(p.host), std::move(p.path), obj_size);
   } else {
     throw std::runtime_error("datasource_factory: scheme '" + p.scheme +
                              "' is registered but object construction is not yet implemented");

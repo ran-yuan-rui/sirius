@@ -173,12 +173,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
 
   sirius_physical_ungrouped_aggregate local_op(
     sirius::from_duckdb_vec(local_types),
-    std::move(local_aggregates),
+    sirius::wrap_many(std::move(local_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
     sirius::from_duckdb_vec(merge_types),
-    std::move(merge_aggregates),
+    sirius::wrap_many(std::move(merge_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
@@ -202,8 +202,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
                  .get_data_batches()[0]
                  ->get_data()
                  ->template cast<gpu_table_representation>()
-                 .get_table();
-  auto view = table.view();
+                 .get_table_view();
+  auto view = table;
 
   REQUIRE(view.num_columns() == 5);
   REQUIRE(view.num_rows() == 1);
@@ -303,12 +303,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
 
   sirius_physical_ungrouped_aggregate local_op(
     sirius::from_duckdb_vec(local_types),
-    std::move(local_aggregates),
+    sirius::wrap_many(std::move(local_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
     sirius::from_duckdb_vec(merge_types),
-    std::move(merge_aggregates),
+    sirius::wrap_many(std::move(merge_aggregates)),
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
@@ -333,8 +333,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
                  .get_data_batches()[0]
                  ->get_data()
                  ->template cast<gpu_table_representation>()
-                 .get_table();
-  auto view = table.view();
+                 .get_table_view();
+  auto view = table;
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.num_rows() == 1);
 

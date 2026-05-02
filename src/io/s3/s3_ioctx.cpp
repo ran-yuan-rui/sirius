@@ -158,7 +158,7 @@ void s3_ioctx::shutdown()
 }
 
 std::unique_ptr<cudf::io::datasource> s3_ioctx::make_datasource(
-  std::unique_ptr<sirius_io_object> io_object)
+  std::shared_ptr<sirius_io_object> io_object)
 {
   return std::make_unique<sirius_datasource>(shared_from_this(), std::move(io_object));
 }

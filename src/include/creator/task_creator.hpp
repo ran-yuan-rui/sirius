@@ -24,10 +24,8 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
-#include "helper/helper.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <blockingconcurrentqueue.h>
@@ -35,16 +33,13 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
-#include <condition_variable>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <variant>
 
 namespace sirius::pipeline {
-class pipeline_executor;
+class task_scheduler;
 class sirius_pipeline_task_global_state;
 }  // namespace sirius::pipeline
 
@@ -106,7 +101,7 @@ class task_creator {
   void set_client_context(::duckdb::ClientContext& client_context);
 
   /// \brief sets pipeline executor reference
-  void set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor);
+  void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
 
   /// \brief prepare global states for all pipelines in the query
   void prepare_for_query(const sirius::planner::query& query);
@@ -184,7 +179,7 @@ class task_creator {
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   std::thread _manager_thread;
   ::duckdb::ClientContext* _client_context;
-  sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
+  sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
   size_t _num_scans_in_plan{0};

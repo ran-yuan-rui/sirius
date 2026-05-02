@@ -60,7 +60,7 @@ class s3_ioctx final : public sirius_ioctx {
   void shutdown() override;
 
   std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::unique_ptr<sirius_io_object> io_object) override;
+    std::shared_ptr<sirius_io_object> io_object) override;
 
   /// HEAD request helper used by the factory before constructing an s3_io_object
   /// so that @c sirius_io_object::size() can remain @c noexcept.

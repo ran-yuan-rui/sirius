@@ -16,12 +16,7 @@
 
 #pragma once
 
-#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
-#include "duckdb/common/enums/operator_result_type.hpp"
-#include "duckdb/common/optional_idx.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -38,6 +33,10 @@
 #include <vector>
 
 namespace sirius {
+
+namespace memory {
+class sirius_memory_reservation_manager;
+}  // namespace memory
 
 namespace op {
 class sirius_physical_operator;
@@ -115,6 +114,16 @@ class operator_data {
   {
     return std::vector<::cucascade::data_batch_processing_handle>{};
   };
+
+  /**
+   * @brief Estimate the uncompressed GPU memory footprint of this data.
+   *
+   * Used by the reservation system to size memory reservations before a task
+   * executes. The default returns 0, which is appropriate for metadata-only
+   * subclasses (e.g. parquet_metadata_input). Subclasses that carry or
+   * represent GPU-resident data should override to return a meaningful estimate.
+   */
+  [[nodiscard]] virtual std::size_t get_estimated_size_in_bytes() const { return 0; }
 };
 
 /**
@@ -169,6 +178,17 @@ class pipelineable_operator_data : public operator_data {
   std::optional<std::vector<::cucascade::data_batch_processing_handle>> prepare_for_processing(
     const ::cucascade::memory::memory_space* requested_memory_space,
     rmm::cuda_stream_view stream) override;
+
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
+  {
+    std::size_t total = 0;
+    for (auto const& batch : _data_batches) {
+      if (batch && batch->get_data()) {
+        total += batch->get_data()->get_uncompressed_data_size_in_bytes();
+      }
+    }
+    return total;
+  }
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
@@ -352,7 +372,7 @@ class sirius_physical_operator {
   //! Add a next port after sink
   void add_next_port_after_sink(next_port_info port_info);
   //! Get the next ports after sink
-  std::vector<sirius_physical_operator::next_port_info>& get_next_port_after_sink();
+  const std::vector<sirius_physical_operator::next_port_info>& get_next_ports_after_sink() const;
 
   //! Get the next task hint
   virtual std::optional<task_creation_hint> get_next_task_hint();
@@ -364,7 +384,6 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
-    return true;
   }
 
   /// \brief check if all tasks have been processed
@@ -372,7 +391,6 @@ class sirius_physical_operator {
   {
     // WSM TODO implement this
     throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
-    return true;
   }
 
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
@@ -382,8 +400,6 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
-  //! Check if the pipeline is finished
-  bool check_pipeline_finished();
 
   //! Get pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;

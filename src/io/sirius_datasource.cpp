@@ -16,7 +16,6 @@
 
 #include "io/sirius_datasource.hpp"
 
-#include "ctrack.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/types.hpp"
 
@@ -55,8 +54,6 @@ size_t copy_pinned_slices_to_device(
   uint8_t* dst,
   rmm::cuda_stream_view stream)
 {
-  CTRACK_NAME("ioctx::copy_pinned_to_device");
-
   // Skip empty slices without touching CUDA.
   size_t n_nonempty = 0;
   for (auto const& s : slices)
@@ -124,7 +121,7 @@ size_t sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size); view) {
+    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       return copy_pinned_slices_to_device(slices, dst, stream);
     }
@@ -136,7 +133,7 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, rmm::cuda_stream_view stream)
 {
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size); view) {
+    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       rmm::device_buffer dbuf(size, stream);
       copy_pinned_slices_to_device(slices, static_cast<uint8_t*>(dbuf.data()), stream);
@@ -153,10 +150,8 @@ void sirius_ioctx::device_read_async(sirius_io_object& obj,
                                      rmm::cuda_stream_view stream,
                                      io_completion_handler handler)
 {
-  CTRACK_NAME("ioctx::device_read_async");
   if (_cache) {
-    if (auto view = _cache->read(obj, offset, size); view) {
-      CTRACK_NAME("ioctx::cache_hit_copy");
+    if (auto view = _cache->read(obj, offset, size, stream.value()); view) {
       auto slices = view.slice(offset, size);
       try {
         auto copied = copy_pinned_slices_to_device(slices, dst, stream);
@@ -167,7 +162,6 @@ void sirius_ioctx::device_read_async(sirius_io_object& obj,
       return;
     }
   }
-  CTRACK_NAME("ioctx::cache_miss_io");
   device_read_io_async(obj, offset, size, dst, stream, std::move(handler));
 }
 
@@ -176,7 +170,7 @@ void sirius_ioctx::device_read_async(sirius_io_object& obj,
 // ---------------------------------------------------------------------------
 
 sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
-                                     std::unique_ptr<sirius_io_object> io_object)
+                                     std::shared_ptr<sirius_io_object> io_object)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_object))
 {
 }

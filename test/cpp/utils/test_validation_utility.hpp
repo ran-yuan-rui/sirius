@@ -25,6 +25,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
@@ -207,17 +208,13 @@ inline bool expect_data_batches_equivalent(const std::shared_ptr<cucascade::data
   auto& lhs_gpu_repr = lhs_data->cast<cucascade::gpu_table_representation>();
   auto& rhs_gpu_repr = rhs_data->cast<cucascade::gpu_table_representation>();
 
-  // Get the cuDF tables
-  auto& lhs_table = lhs_gpu_repr.get_table();
-  auto& rhs_table = rhs_gpu_repr.get_table();
-
   // Get table views for comparison
-  auto lhs_view = lhs_table.view();
-  auto rhs_view = rhs_table.view();
+  auto lhs_view = lhs_gpu_repr.get_table_view();
+  auto rhs_view = rhs_gpu_repr.get_table_view();
 
   // If sort is requested, sort both tables by all columns
   if (sort) {
-    auto mr     = rmm::mr::get_current_device_resource();
+    auto mr     = cudf::get_current_device_resource_ref();
     auto stream = cudf::get_default_stream();
 
     // Create column indices for sorting (all columns)
@@ -266,15 +263,12 @@ inline bool expect_data_batch_equivalent_to_table(
   // Cast to gpu_table_representation
   auto& batch_gpu_repr = batch_data->cast<cucascade::gpu_table_representation>();
 
-  // Get the cuDF table
-  auto& batch_table = batch_gpu_repr.get_table();
-
   // Get table view for comparison
-  auto batch_view = batch_table.view();
+  auto batch_view = batch_gpu_repr.get_table_view();
 
   // If sort is requested, sort both tables by all columns
   if (sort) {
-    auto mr     = rmm::mr::get_current_device_resource();
+    auto mr     = cudf::get_current_device_resource_ref();
     auto stream = cudf::get_default_stream();
 
     // Create column indices for sorting (all columns)

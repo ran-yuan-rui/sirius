@@ -110,7 +110,7 @@ class sirius_engine {
   //! Pre-fetch iceberg table metadata (delete files) for all iceberg scans in the plan.
   //! Must be called from initialize() BEFORE initialize_internal() assigns operator IDs
   //! to pipeline-breaker operators (PARTITION, CONCAT, etc.).
-  void prefetch_iceberg_metadata(op::sirius_physical_operator& plan);
+  void prefetch_iceberg_delete_data(op::sirius_physical_operator& plan);
   //! Create a child pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
@@ -127,15 +127,17 @@ class sirius_engine {
   // ---------------------------------------------------------------------------
   // Iceberg metadata cache
   //
-  // Populated by prefetch_iceberg_metadata() in initialize(), BEFORE
+  // Populated by prefetch_iceberg_delete_data() in initialize(), BEFORE
   // initialize_internal() runs.  Keyed by iceberg table path string.
   // ---------------------------------------------------------------------------
-  std::unordered_map<std::string, op::scan::IcebergDeleteFiles> iceberg_metadata_cache_;
+  std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>
+    iceberg_delete_data_cache_;
 
-  //! Registry of per-scheme sirius_ioctx instances (file, s3, gds, ...).
-  //! Populated at construction with a default uring_ioctx for "file".
-  //! Object-store backends (s3, ...) are registered lazily from the active
-  //! sirius_config on first access once a SiriusContext is attached.
+  //! Registry of per-scheme sirius_ioctx instances (s3, future gds, ...).
+  //! Object-store backends are registered lazily from the active sirius_config
+  //! on first access once a SiriusContext is attached. Local file paths bypass
+  //! the registry and go through cudf's default datasource (see
+  //! datasource_factory::create file branch).
   [[nodiscard]] io::datasource_registry& datasource_registry();
 
   //! Returns the sirius_config attached to this engine's SiriusContext.

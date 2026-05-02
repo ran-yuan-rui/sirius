@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_table_scan.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
@@ -125,7 +126,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     for (const auto& batch : raw_input_batches) {
       if (batch && batch->get_data()) {
         auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
-        table_views.push_back(gpu_rep.get_table().view());
+        table_views.push_back(gpu_rep.get_table_view());
         if (!space) { space = batch->get_memory_space(); }
       }
     }
@@ -146,17 +147,19 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   // Apply table filters as a GPU expression if present.
   std::shared_ptr<cucascade::data_batch> output_batch;
-  duckdb::unique_ptr<duckdb::Expression> filter_expr;
+  sirius::expression local_filter_expr;
   if (table_filters) {
-    filter_expr = convert_table_filters_to_expression(
-      *table_filters, column_ids, returned_types, batch_column_map);
+    local_filter_expr = sirius::wrap(convert_table_filters_to_expression(
+      *table_filters, column_ids, returned_types, batch_column_map));
   }
 
-  if (filter_expr != nullptr) {
+  if (static_cast<bool>(local_filter_expr)) {
     sirius::gpu_expression_executor gpu_expression_executor(
-      filter_expr.get(), cudf::get_current_device_resource_ref(), stream);
-    output_batch = gpu_expression_executor.select(batch_ref);
-    if (!output_batch) { return std::make_unique<pipelineable_operator_data>(); }
+      local_filter_expr, cudf::get_current_device_resource_ref(), stream);
+    auto filtered_table = gpu_expression_executor.select(
+      batch_ref->get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    output_batch =
+      sirius::make_data_batch(std::move(filtered_table), *batch_ref->get_memory_space());
   } else {
     output_batch = batch_ref;
   }
@@ -164,15 +167,15 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // After filtering, project away filter-only columns if the batch has more
   // columns than the operator's output type list expects.
   std::size_t expected_output_columns = types.size();
-  auto& gpu_rep   = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  auto& out_table = gpu_rep.get_table();
+  auto& gpu_rep       = output_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  auto out_table_view = gpu_rep.get_table_view();
 
   if (expected_output_columns == 0) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
   }
 
-  if (static_cast<std::size_t>(out_table.num_columns()) > expected_output_columns) {
+  if (static_cast<std::size_t>(out_table_view.num_columns()) > expected_output_columns) {
     SIRIUS_LOG_DEBUG(
       "TABLE_SCAN projection: expected_output_columns={}, projection_ids.size()={}, "
       "column_ids.size()={}",
@@ -188,7 +191,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                     projection_ids.size()));
     }
 
-    auto table   = gpu_rep.release_table();
+    auto table   = gpu_rep.release_table(stream);
     auto columns = table->release();
 
     // Select output columns using the batch column map.

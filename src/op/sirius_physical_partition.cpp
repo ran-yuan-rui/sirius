@@ -18,6 +18,7 @@
 
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression/expression_internal.hpp"
 #include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -79,14 +80,14 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (std::size_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
       auto& condition = hash_join_op.conditions[cond_idx];
-      if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-          condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      if (condition.comparison != sirius::comparison_type::equal &&
+          condition.comparison != sirius::comparison_type::not_distinct_from) {
         continue;
       }
       std::optional<std::size_t> left_index =
-        extract_bound_ref_index(*hash_join_op.conditions[cond_idx].left);
+        extract_bound_ref_index(*sirius::unwrap(hash_join_op.conditions[cond_idx].left));
       std::optional<std::size_t> right_index =
-        extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
+        extract_bound_ref_index(*sirius::unwrap(hash_join_op.conditions[cond_idx].right));
       if (left_index.has_value() && right_index.has_value()) {
         // Determine if a type cast is needed for hash alignment.
         // When the join condition has a BOUND_CAST on one side, the two sides have different
@@ -94,8 +95,8 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         // values for the same integer in different representations, so without a cast, matching
         // keys would land in different partitions. We apply the same cast used by the join
         // condition so both sides hash identically.
-        const auto& key_expr = is_build ? *hash_join_op.conditions[cond_idx].right
-                                        : *hash_join_op.conditions[cond_idx].left;
+        const auto& key_expr = is_build ? *sirius::unwrap(hash_join_op.conditions[cond_idx].right)
+                                        : *sirius::unwrap(hash_join_op.conditions[cond_idx].left);
         if (is_build) {
           _partition_keys.push_back(right_index.value());
         } else {
@@ -289,7 +290,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
           hash_join.is_build_probe_mode()) {
         // Either sibling may run this block first; configure the build-side CONCAT only.
         auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
-          for (auto& next_port : part_op.get_next_port_after_sink()) {
+          for (auto& next_port : part_op.get_next_ports_after_sink()) {
             if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
             auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
             if (concat.is_build_concat()) { concat.set_concat_all(true); }

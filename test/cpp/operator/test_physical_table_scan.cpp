@@ -129,8 +129,8 @@ TEMPLATE_TEST_CASE(
                         .get_data_batches()[0]
                         ->get_data()
                         ->cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view    = output_table.view();
+                        .get_table_view();
+  auto out_view    = output_table;
   auto host_vals   = copy_column_to_host<typename Traits::type>(out_view.column(1));
   auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
 
@@ -203,8 +203,8 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
                         .get_data_batches()[0]
                         ->get_data()
                         ->cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view = output_table.view();
+                        .get_table_view();
+  auto out_view = output_table;
 
   // Verify all data passes through unchanged
   auto host_col0 = copy_column_to_host<int64_t>(out_view.column(0));
@@ -278,8 +278,8 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
                         .get_data_batches()[0]
                         ->get_data()
                         ->cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view = output_table.view();
+                        .get_table_view();
+  auto out_view = output_table;
 
   auto host_col0 = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_col1 = copy_column_to_host<int32_t>(out_view.column(1));
@@ -351,8 +351,8 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
                  .get_data_batches()[0]
                  ->get_data()
                  ->cast<gpu_table_representation>()
-                 .get_table();
-  auto view = table.view();
+                 .get_table_view();
+  auto view = table;
   REQUIRE(view.num_columns() == 2);
   REQUIRE(view.num_rows() == 0);
 }
@@ -413,7 +413,7 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
   // INT64 > 3 should translate successfully
   REQUIRE(table_scan.passthrough == true);
   REQUIRE(parquet_scan.translated_filter.has_value());
-  REQUIRE(table_scan.filter_expr != nullptr);
+  REQUIRE(!table_scan.filter_expr.is_null());
 
   // In passthrough mode, execute() returns input data unchanged
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
@@ -424,8 +424,8 @@ TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
                         .get_data_batches()[0]
                         ->get_data()
                         ->cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view    = output_table.view();
+                        .get_table_view();
+  auto out_view    = output_table;
   auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data   = copy_column_to_host<int32_t>(out_view.column(1));
 
@@ -520,7 +520,7 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
   // DECIMAL64 > 3.00 should translate successfully
   REQUIRE(table_scan.passthrough == true);
   REQUIRE(parquet_scan.translated_filter.has_value());
-  REQUIRE(table_scan.filter_expr != nullptr);
+  REQUIRE(!table_scan.filter_expr.is_null());
 
   // In passthrough mode, execute() returns input data unchanged
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
@@ -531,8 +531,8 @@ TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
                         .get_data_batches()[0]
                         ->get_data()
                         ->cast<gpu_table_representation>()
-                        .get_table();
-  auto out_view  = output_table.view();
+                        .get_table_view();
+  auto out_view  = output_table;
   auto host_dec  = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_data = copy_column_to_host<int32_t>(out_view.column(1));
 

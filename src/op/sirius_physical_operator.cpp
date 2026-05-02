@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_operator.hpp"
 
-#include "gpu_executor.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -216,8 +215,8 @@ void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info
   next_port_after_sink.push_back(port_info);
 }
 
-std::vector<sirius_physical_operator::next_port_info>&
-sirius_physical_operator::get_next_port_after_sink()
+const std::vector<sirius_physical_operator::next_port_info>&
+sirius_physical_operator::get_next_ports_after_sink() const
 {
   return next_port_after_sink;
 }

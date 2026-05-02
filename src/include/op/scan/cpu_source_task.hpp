@@ -24,10 +24,10 @@
 #include <duckdb/main/client_context.hpp>
 #include <op/sirius_physical_cpu_source.hpp>
 #include <parallel/task.hpp>
-#include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
+#include <pipeline/task_scheduler.hpp>
 #include <sirius_context.hpp>
 
 namespace sirius::op::scan {
@@ -45,8 +45,7 @@ class cpu_source_task_global_state : public pipeline::sirius_pipeline_task_globa
   std::vector<sirius_physical_operator*> get_output_consumers() const noexcept
   {
     std::vector<sirius_physical_operator*> output_consumers;
-    auto ports = _op.get_next_port_after_sink();
-    for (auto& next_port : ports) {
+    for (const auto& next_port : _op.get_next_ports_after_sink()) {
       output_consumers.push_back(next_port.next_operator);
     }
     return output_consumers;

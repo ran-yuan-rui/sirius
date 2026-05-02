@@ -19,7 +19,11 @@
 #include "config.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
+#include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -126,9 +130,9 @@ void SiriusContext::QueryBegin(ClientContext& context)
     spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
     bool query_cache_hit = false;
     if (config_.is_scan_caching_enabled()) {
-      query_cache_hit = pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
+      query_cache_hit = task_scheduler_->get_scan_executor().cache_scan_results_for_query(query);
     }
-    pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
+    task_scheduler_->set_scan_caching_config(config_.get_cache_level());
 
     task_creator_->reset(query_cache_hit);
     task_creator_->set_client_context(context);
@@ -207,8 +211,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       if (fsmr != nullptr) {
         small_pinned_allocator_ =
           std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr);
+        small_pinned_allocator_view_.emplace(
+          sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
         prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
-        prev_pinned_mr_        = cudf::set_pinned_memory_resource(*small_pinned_allocator_);
+        prev_pinned_mr_        = cudf::set_pinned_memory_resource(
+          rmm::host_device_async_resource_ref{*small_pinned_allocator_view_});
         cudf::set_allocate_host_as_pinned_threshold(
           cucascade::memory::small_pinned_host_memory_resource::MAX_SLAB_SIZE);
         spdlog::info("SiriusContext: cuDF pinned memory resource configured (max slab {} B)",
@@ -219,7 +226,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
-  // Create one downgrade executor per GPU memory space BEFORE pipeline_executor,
+  // Create one downgrade executor per GPU memory space BEFORE task_scheduler,
   // so pointers are available for injection into gpu_pipeline_executors.
   // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
@@ -233,33 +240,44 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         const_cast<cucascade::memory::memory_space*>(space),
         *memory_manager_);
       // NOTE: do not call executor->start() here -- deferred until after
-      // pipeline_executor_ and task_creator_ are constructed.
+      // task_scheduler_ and task_creator_ are constructed.
       downgrade_executors_.push_back(std::move(executor));
     }
   };
   create_executors_for_tier(cucascade::memory::Tier::GPU);
+  create_executors_for_tier(cucascade::memory::Tier::HOST);
 
-  pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    config_.get_gpu_pipeline_executor_config(),
-    config_.get_duckdb_scan_executor_config(),
-    *memory_manager_,
-    &config_.get_hw_topology(),
-    &downgrade_executors_);
+  task_scheduler_ =
+    std::make_unique<sirius::pipeline::task_scheduler>(config_.get_gpu_pipeline_executor_config(),
+                                                       config_.get_duckdb_scan_executor_config(),
+                                                       *memory_manager_,
+                                                       &config_.get_hw_topology(),
+                                                       &downgrade_executors_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_config(),
                                                                   *memory_manager_);
-  task_creator_->set_pipeline_executor(*pipeline_executor_);
-  pipeline_executor_->set_task_creator(*task_creator_);
+  task_creator_->set_task_scheduler(*task_scheduler_);
+  task_scheduler_->set_task_creator(*task_creator_);
+
+  scan_manager_ =
+    std::make_unique<sirius::scan_manager::sirius_scan_manager>(config_.get_scan_manager_config());
+
+  // Wire the pipeline task queue into downgrade executors now that task_scheduler_
+  // has been constructed.
+  for (auto& executor : downgrade_executors_) {
+    executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
+  }
 
   // Start everything -- downgrade executors deferred until now
   for (auto& executor : downgrade_executors_) {
     executor->start();
   }
   task_creator_->start_thread_pool();
-  pipeline_executor_->start();
+  scan_manager_->start();
+  task_scheduler_->start();
 
   // Configure scan caching based on config
-  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
+  task_scheduler_->set_scan_caching_config(config_.get_cache_level());
 
   is_initialized_ = true;
 }
@@ -268,8 +286,12 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
-  pipeline_executor_->stop();
-  pipeline_executor_.reset();
+  task_scheduler_->stop();
+  task_scheduler_.reset();
+  if (scan_manager_) {
+    scan_manager_->stop();
+    scan_manager_->reset();
+  }
   task_creator_->stop_thread_pool();
   task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
@@ -294,6 +316,7 @@ void SiriusContext::terminate()
 
   // Release the slab allocator before tearing down the memory manager, since
   // its owned_allocations_ will return blocks back to the fixed_size_host_memory_resource.
+  small_pinned_allocator_view_.reset();
   small_pinned_allocator_.reset();
 
   memory_manager_->shutdown();
@@ -326,16 +349,16 @@ const cucascade::shared_data_repository_manager& SiriusContext::get_data_reposit
   return *data_repository_manager_;
 }
 
-sirius::pipeline::pipeline_executor& SiriusContext::get_pipeline_executor()
+sirius::pipeline::task_scheduler& SiriusContext::get_task_scheduler()
 {
   throw_if_not_initialized();
-  return *pipeline_executor_;
+  return *task_scheduler_;
 }
 
-const sirius::pipeline::pipeline_executor& SiriusContext::get_pipeline_executor() const
+const sirius::pipeline::task_scheduler& SiriusContext::get_task_scheduler() const
 {
   throw_if_not_initialized();
-  return *pipeline_executor_;
+  return *task_scheduler_;
 }
 
 sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executor(
@@ -377,13 +400,26 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
   return *task_creator_;
 }
 
+sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager()
+{
+  throw_if_not_initialized();
+  return *scan_manager_;
+}
+
+const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager() const
+{
+  throw_if_not_initialized();
+  return *scan_manager_;
+}
+
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines)
 {
   throw_if_not_initialized();
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipelines));
-  pipeline_executor_->prepare_for_query(query_);
+  task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
+  scan_manager_->prepare_for_query(*query_);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
@@ -465,7 +501,17 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementMode mode)
 {
   if (is_internal_query_active()) { return RebindQueryInfo::DO_NOT_REBIND; }
-  if (!captured_logical_plan_) { return RebindQueryInfo::DO_NOT_REBIND; }
+  // Mirror the optimizer hook's gpu_execution gate: when transparent execution
+  // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
+  // never rewrite the physical plan even if we could.
+  {
+    duckdb::Value setting;
+    auto have_setting = context.TryGetCurrentSetting("gpu_execution", setting);
+    if (!have_setting || setting.IsNull() || !setting.GetValue<bool>()) {
+      captured_logical_plan_.reset();
+      return RebindQueryInfo::DO_NOT_REBIND;
+    }
+  }
   if (!is_initialized_) {
     captured_logical_plan_.reset();
     return RebindQueryInfo::DO_NOT_REBIND;
@@ -477,20 +523,80 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     return RebindQueryInfo::DO_NOT_REBIND;
   }
 
-  auto logical_plan = take_captured_logical_plan();
+  // If the optimizer hook captured a plan, use it. Otherwise (e.g. iceberg_scan
+  // whose bind_data isn't serializable so plan->Copy() failed), re-plan from the
+  // unbound SQL statement — this is what gpu_execution(...) does internally and
+  // it works even when LogicalGet::Copy can't.
+  unique_ptr<LogicalOperator> logical_plan = take_captured_logical_plan();
+  // Try to capture the SQL string while the active query context is alive —
+  // PreparedStatementData::unbound_statement isn't populated until *after*
+  // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
+  // ClientContext::GetCurrentQuery() unconditionally derefs active_query;
+  // outside a query lifecycle (e.g. plain Prepare()) it would throw, so guard
+  // it. When the SQL is unavailable we still proceed with the captured plan
+  // (which covers all non-iceberg cases including prepared statements).
+  std::string current_query_sql;
+  try {
+    current_query_sql = context.GetCurrentQuery();
+  } catch (std::exception&) {
+    current_query_sql.clear();
+  }
+  if (!logical_plan) {
+    if (current_query_sql.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
+    try {
+      InternalQueryGuard guard(*this);  // suppress recursive optimizer hooks
+      Parser parser(context.GetParserOptions());
+      parser.ParseQuery(current_query_sql);
+      if (parser.statements.size() != 1) { return RebindQueryInfo::DO_NOT_REBIND; }
+      Planner planner(context);
+      planner.CreatePlan(std::move(parser.statements[0]));
+      Optimizer optimizer(*planner.binder, context);
+      logical_plan = optimizer.Optimize(std::move(planner.plan));
+    } catch (NotImplementedException& e) {
+      record_transparent_fallback();
+      spdlog::info("Transparent execution fallback (replan unsupported): {}", e.what());
+      return RebindQueryInfo::DO_NOT_REBIND;
+    } catch (std::exception& e) {
+      record_transparent_fallback();
+      spdlog::info("Transparent execution fallback (replan failed): {}", e.what());
+      return RebindQueryInfo::DO_NOT_REBIND;
+    }
+    if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
+  }
 
   try {
     // Validate that the captured logical plan is GPU-translatable before we
     // install a reusable transparent execution operator for prepared statements.
+    //
+    // For plans whose LogicalGet does not implement Copy (e.g. iceberg_scan
+    // bind_data has no serializer), validation runs against `logical_plan`
+    // directly and consumes it; we then re-plan from `unbound_statement` for
+    // the actual execution path. PhysicalSiriusExecution falls back to
+    // re-planning per execute when its `logical_plan_` is null.
     sirius::planner::sirius_physical_plan_generator planner(context);
-    planner.create_plan(logical_plan->Copy(context));
+    duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
+    bool plan_is_copyable = true;
+    try {
+      validation_plan = logical_plan->Copy(context);
+    } catch (NotImplementedException&) {
+      plan_is_copyable = false;
+    }
+    if (plan_is_copyable) {
+      planner.create_plan(std::move(validation_plan));
+    } else {
+      // Validate by consuming the freshly re-planned logical_plan; the
+      // PhysicalSiriusExecution operator will re-plan again at execute time
+      // using the SQL string we cached above.
+      planner.create_plan(std::move(logical_plan));
+      logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
+    }
 
     spdlog::info("Transparent execution: Sirius physical plan generated successfully");
 
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
     auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
-      std::move(logical_plan), prepared.types, prepared.names, 0);
+      std::move(logical_plan), current_query_sql, prepared.types, prepared.names, 0);
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.
