@@ -18,6 +18,7 @@
 
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/shared_ptr_ipp.hpp"
+#include "io/datasource_factory.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
@@ -198,6 +199,19 @@ void sirius_pipeline_converter::split_parquet_scan_source(
   scan_info->names             = scan_op.names;
   scan_info->table_filters     = std::move(scan_op.table_filters);
   scan_info->partition_indices = partition_indices;
+
+  // Capture the engine by reference so the provider can route s3:// (and future
+  // object-store schemes) through the registry+config without scan_manager or
+  // SiriusContext having to know about either. The engine outlives the plan it
+  // owns, so the reference is valid for any call to the closure.
+  //
+  // Dispatch (relative bare path → cudf default; everything else → strict factory)
+  // is centralized in datasource_factory::create_for_parquet_scan so all parquet
+  // scan-IO call sites share one rule.
+  scan_info->open_datasource = [&engine = engine_](std::string_view uri) {
+    return io::datasource_factory::create_for_parquet_scan(
+      uri, engine.datasource_registry(), engine.config());
+  };
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));

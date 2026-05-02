@@ -80,6 +80,21 @@ std::string datasource_factory::extract_scheme(std::string_view uri) { return pa
 
 std::string datasource_factory::extract_path(std::string_view uri) { return parse(uri).path; }
 
+std::unique_ptr<cudf::io::datasource> datasource_factory::create_for_parquet_scan(
+  std::string_view uri, datasource_registry const& registry, sirius_config const& config)
+{
+  // Relative bare paths (no leading '/' and no scheme://) — DuckDB's iceberg /
+  // hive fixtures still hand these out, and the strict parser deliberately
+  // rejects them. Bypass to cudf default; semantically identical to the pre-PR3
+  // baseline. Anything else (absolute path, file:///..., s3://...) goes through
+  // the strict create() so its parser routes file→cudf and object-store→ioctx
+  // uniformly.
+  if (!uri.empty() && uri.front() != '/' && uri.find("://") == std::string_view::npos) {
+    return cudf::io::datasource::create(std::string{uri});
+  }
+  return create(uri, registry, config);
+}
+
 std::unique_ptr<cudf::io::datasource> datasource_factory::create(
   std::string_view uri, datasource_registry const& registry, sirius_config const& /*config*/)
 {

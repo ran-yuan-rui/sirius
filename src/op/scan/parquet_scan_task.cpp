@@ -343,10 +343,12 @@ void parquet_scan_task_global_state::initialize_from_files()
   // Route datasource construction through the per-engine factory so that
   // non-local schemes (s3://, gds://, …) get dispatched to their registered
   // ioctx instead of falling back to cudf's default local-file datasource.
+  // Use the lenient entry point: DuckDB's MultiFileBindData / iceberg fixtures
+  // can hand out relative bare paths that the strict factory parser rejects.
   auto& engine = get_pipeline()->get_engine();
   for (auto const& file_path : _file_paths) {
-    auto datasource =
-      io::datasource_factory::create(file_path, engine.datasource_registry(), engine.config());
+    auto datasource = io::datasource_factory::create_for_parquet_scan(
+      file_path, engine.datasource_registry(), engine.config());
     auto const file_size = datasource->size();
     datasources.push_back(std::move(datasource));
 
@@ -826,7 +828,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
 
   if (!_datasource) {
     auto& engine = g_state.get_pipeline()->get_engine();
-    _datasource  = io::datasource_factory::create(
+    _datasource  = io::datasource_factory::create_for_parquet_scan(
       g_state.get_file_path(l_state.get_file_idx()), engine.datasource_registry(), engine.config());
   }
 

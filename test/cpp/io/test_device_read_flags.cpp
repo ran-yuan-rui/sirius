@@ -61,7 +61,7 @@ class probe_ioctx : public sirius_ioctx {
  public:
   void shutdown() override {}
 
-  std::unique_ptr<cudf::io::datasource> make_datasource(std::unique_ptr<sirius_io_object>) override
+  std::unique_ptr<cudf::io::datasource> make_datasource(std::shared_ptr<sirius_io_object>) override
   {
     throw std::logic_error("probe_ioctx::make_datasource: not exercised");
   }
@@ -144,7 +144,7 @@ TEST_CASE("uring-backed sirius_datasource advertises device reads", "[io_caps]")
     return;
   }
 
-  sirius_datasource ds{ctx, std::make_unique<mock_io_object>()};
+  sirius_datasource ds{ctx, std::make_shared<mock_io_object>()};
 
   // In the new IO framework, sirius_datasource always exposes a device-read
   // path. Backends may use direct device IO or a host-bounce implementation,
@@ -158,7 +158,7 @@ TEST_CASE("uring-backed sirius_datasource advertises device reads", "[io_caps]")
 TEST_CASE("sirius_datasource device-read flags are backend-agnostic", "[io_caps]")
 {
   auto ctx = std::make_shared<probe_ioctx>();
-  sirius_datasource ds{ctx, std::make_unique<mock_io_object>()};
+  sirius_datasource ds{ctx, std::make_shared<mock_io_object>()};
 
   CHECK(ds.io_ctx().get() == ctx.get());
   CHECK(ds.supports_device_read());

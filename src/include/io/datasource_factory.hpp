@@ -139,6 +139,35 @@ class datasource_factory {
                                                       sirius_config const& config);
 
   /**
+   * @brief Lenient entry point for parquet-scan IO whose @p uri originates in
+   *        DuckDB's @c MultiFileBindData / @c scan_op.parameters and may be a
+   *        bare relative path rather than a normalized URI.
+   *
+   * Dispatch:
+   *   - Relative bare path (no leading @c '/' and no @c "://"): bypass the
+   *     factory and return cudf's default datasource directly. This matches
+   *     the pre-PR3 baseline; it covers iceberg / hive test fixtures that
+   *     hand out paths like @c "test/cpp/integration/data/...parquet".
+   *   - Anything else (absolute path, @c file:///..., @c s3://..., future
+   *     object-store schemes): delegate to the strict @c create above. The
+   *     parser accepts these and routes file scheme to cudf default, object
+   *     stores to the registered @c sirius_ioctx.
+   *
+   * The strict @c create keeps its parser-strict contract — prefer it for
+   * callers that should reject unscheme'd input as a real bug (e.g., the
+   * @c sirius_read_parquet S3 materializer in @c sirius_extension.cpp).
+   *
+   * @throw std::invalid_argument if the URI is empty (preserves strict
+   *                              @c create's empty-URI rejection).
+   * @throw std::runtime_error    on object-store dispatch failure (same
+   *                              as strict @c create).
+   */
+  static std::unique_ptr<cudf::io::datasource> create_for_parquet_scan(
+    std::string_view uri,
+    datasource_registry const& registry,
+    sirius_config const& config);
+
+  /**
    * @brief Extract the URI scheme. Thin shim over @c sirius::io::parse.
    *        Prefer calling @c parse directly for new code; retained for
    *        compatibility with PR1 callsites and tests.

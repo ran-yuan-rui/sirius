@@ -29,6 +29,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -55,7 +56,7 @@ class mock_ioctx : public sirius_ioctx {
   void shutdown() override {}
 
   std::unique_ptr<cudf::io::datasource> make_datasource(
-    std::unique_ptr<sirius_io_object> /*io_object*/) override
+    std::shared_ptr<sirius_io_object> /*io_object*/) override
   {
     make_datasource_calls.fetch_add(1, std::memory_order_relaxed);
     throw std::runtime_error("mock_ioctx::make_datasource: not exercised in PR1");
