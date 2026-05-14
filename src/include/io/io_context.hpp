@@ -76,6 +76,15 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
   [[nodiscard]] prefetching_cache* cache() noexcept { return _cache.get(); }
 
+ protected:
+  /// Destroy the owned prefetching_cache.  Defined out-of-line in
+  /// io_context.cpp where prefetching_cache is complete.  Must be called
+  /// from every concrete backend's destructor body BEFORE the backend's
+  /// own members destruct: the cache's worker thread dispatches IO
+  /// through the backend, so reactors / handle pools must outlive it.
+  void reset_cache() noexcept;
+
+ public:
   // -- Read API ---------------------------------------------------------------
 
   size_t host_read(sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst);

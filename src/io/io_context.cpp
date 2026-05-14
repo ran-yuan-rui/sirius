@@ -41,6 +41,8 @@ void sirius_ioctx::initialize_cache(buffer_pool& pool, size_t inflight_budget_ch
   _cache = std::make_unique<prefetching_cache>(pool, this, inflight_budget_chunks);
 }
 
+void sirius_ioctx::reset_cache() noexcept { _cache.reset(); }
+
 namespace {
 
 // Copy each pinned-host slice to the device buffer on @p stream.

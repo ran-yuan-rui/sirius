@@ -297,6 +297,13 @@ void SiriusContext::terminate()
   if (scan_manager_) {
     scan_manager_->stop();
     scan_manager_->reset();
+    // Destroy the scan_manager unique_ptr NOW, before memory_manager_ is
+    // shut down below. scan_manager_'s buffer_pool / uring_ioctx hold
+    // fixed_multiple_blocks_allocation handles that call back into the
+    // host fixed_size_host_memory_resource on destruction; if we leave
+    // scan_manager_ alive past memory_manager_->shutdown() it would
+    // dereference a freed FSMR during ~SiriusContext member destruction.
+    scan_manager_.reset();
   }
   task_creator_->stop_thread_pool();
   task_creator_.reset();

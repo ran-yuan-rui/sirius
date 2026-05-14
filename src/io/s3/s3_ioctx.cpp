@@ -170,7 +170,16 @@ s3_ioctx::s3_ioctx(s3_ioctx_config config) : _cfg(std::move(config))
   ensure_curl_inited();
 }
 
-s3_ioctx::~s3_ioctx() { shutdown(); }
+s3_ioctx::~s3_ioctx()
+{
+  // _cache (sirius_ioctx base) holds worker threads that dispatch IO through
+  // s3_ioctx members (libcurl handle pool, credential provider). Base members
+  // destruct AFTER derived members, so without this explicit reset the cache
+  // worker would access freed s3_ioctx state during process teardown. Mirrors
+  // the same fix applied to templated_ioctx for the uring backend.
+  reset_cache();
+  shutdown();
+}
 
 void s3_ioctx::shutdown()
 {

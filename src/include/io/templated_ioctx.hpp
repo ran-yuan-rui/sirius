@@ -120,6 +120,17 @@ class templated_ioctx : public sirius_ioctx {
       _reactors.emplace_back(factory());
   }
 
+  ~templated_ioctx() override
+  {
+    // _cache lives in the sirius_ioctx base, which destructs AFTER our
+    // _reactors. The cache's worker thread dispatches IO through the
+    // reactors; if reactors die first, the worker writes to freed memory
+    // when joined, surfacing as glibc heap corruption (typically during
+    // process teardown TLS free). Tear the cache down here, in the
+    // derived dtor body, while _reactors are still alive.
+    this->reset_cache();
+  }
+
   void shutdown() override
   {
     for (auto& r : _reactors)
