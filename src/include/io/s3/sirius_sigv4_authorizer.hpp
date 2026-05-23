@@ -25,73 +25,86 @@
 namespace sirius::io::s3 {
 
 /**
- * @brief Default @c s3_request_authorizer implementation: hand-rolled SigV4
- *        over static credentials.
+ * @brief Common base for the built-in SigV4 authorizers: hand-rolled SigV4 over
+ *        static credentials, no @c aws-sdk-cpp.
  *
- * Wraps the @c sirius::io::s3::sigv4 module to produce presigned URLs without
- * pulling in @c aws-sdk-cpp. Suitable for:
- *   - production with long-lived access keys (typical SET s3_access_key /
- *     s3_secret_key flow),
- *   - production with externally-rotated temporary credentials (caller
- *     reconstructs the authorizer on rotation; this impl does not refresh).
- *
- * Downstream projects that want refresh-aware credentials (IMDS / STS chain /
- * SSO) should ship their own @c s3_request_authorizer implementation; the
- * public surface is a single @c authorize() call so they can do so without
- * exposing raw keys to Sirius.
+ * Holds the credentials + signing scope and parses/validates the endpoint into
+ * scheme + host. Concrete subclasses choose the signing form (presigned URL vs
+ * Authorization header). Suitable for long-lived access keys and
+ * externally-rotated temporary credentials (reconstruct the authorizer on
+ * rotation; these impls do not refresh). Downstream projects that want
+ * refresh-aware credentials (IMDS / STS chain / SSO) ship their own
+ * @c s3_request_authorizer; the public surface is a single @c authorize() call
+ * so they can do so without exposing raw keys to Sirius.
  */
-class sirius_sigv4_presigned_authorizer final : public s3_request_authorizer {
+class sirius_sigv4_authorizer_base : public s3_request_authorizer {
+ protected:
+  /// @param region    Signing region (e.g. @c "us-east-1").
+  /// @param endpoint  scheme://host[:port], no path / query / fragment.
+  /// @throw sirius::io::credential_error on empty creds, empty region, or
+  ///        malformed endpoint.
+  sirius_sigv4_authorizer_base(static_credentials creds, std::string region, std::string endpoint);
+
+  static_credentials _creds;
+  std::string _region;
+  std::string _scheme;  // "https" / "http"
+  std::string _host;    // host[:port]
+};
+
+/**
+ * @brief Default authorizer: SigV4 presigned URL for path-style S3 access
+ *        (@c "{scheme}://{host}/{bucket}/{key}?X-Amz-...").
+ *
+ * @c authorize() returns the presigned URL with EMPTY headers (auth lives in the
+ * URL query). @p default_ttl sets @c X-Amz-Expires; a positive per-call timeout
+ * overrides it. Inline-at-request-time presigning keeps TTLs short, limiting the
+ * blast radius of an accidentally-leaked URL.
+ */
+class sirius_sigv4_presigned_authorizer final : public sirius_sigv4_authorizer_base {
  public:
-  /**
-   * @brief Construct with static credentials, signing scope, endpoint, and
-   *        default TTL.
-   *
-   * @param creds        Access key, secret key, optional session token,
-   *                     optional @c expires_at (informational only — this
-   *                     impl does not refresh).
-   * @param region       Signing region (e.g. @c "us-east-1").
-   * @param endpoint     Fully-qualified service URL:
-   *                     @c "https://s3.us-east-1.amazonaws.com",
-   *                     @c "http://minio.local:9000", etc. Must be
-   *                     scheme://host[:port] with no path / query / fragment.
-   * @param default_ttl  @c X-Amz-Expires for every presigned URL produced.
-   *                     Default 5 minutes — inline-at-request-time presigning
-   *                     means URLs are issued just before the libcurl call,
-   *                     so a short TTL is safe and limits the blast radius
-   *                     of an accidentally-leaked URL.
-   *
-   * @throw sirius::io::credential_error on empty creds, empty region,
-   *                                     non-positive @p default_ttl, or
-   *                                     malformed endpoint.
-   */
+  /// @throw sirius::io::credential_error on empty creds/region, malformed
+  ///        endpoint, or non-positive @p default_ttl.
   sirius_sigv4_presigned_authorizer(static_credentials creds,
                                     std::string region,
                                     std::string endpoint,
                                     std::chrono::seconds default_ttl = std::chrono::minutes{5});
 
-  /**
-   * @brief Authorize a request via a SigV4 presigned URL for path-style S3
-   *        access: @c "{scheme}://{host}/{bucket}/{key}?X-Amz-...". The
-   *        returned @c s3_authorized_request carries the presigned URL with
-   *        empty headers (auth lives in the URL query).
-   *
-   * Thread-safe: the underlying @c sigv4::presign_url is pure (no shared
-   * mutable state) and this authorizer's members are immutable after
-   * construction.
-   *
-   * @throw sirius::io::credential_error on empty bucket / key, or any failure
-   *                                     surfaced from the SigV4 layer.
-   */
+  /// Thread-safe: @c sigv4::presign_url is pure and members are immutable after
+  /// construction.
+  /// @throw sirius::io::credential_error on empty bucket / key or SigV4 failure.
   s3_authorized_request authorize(s3_object_ref const& obj,
                                   s3_request_method method,
                                   std::chrono::seconds timeout) override;
 
  private:
-  static_credentials _creds;
-  std::string _region;
-  std::string _scheme;  // "https" / "http"
-  std::string _host;    // host[:port]
   std::chrono::seconds _ttl;
+};
+
+/**
+ * @brief Header-signing authorizer: SigV4 in the @c Authorization header
+ *        (@c sigv4::sign_request).
+ *
+ * @c authorize() returns a plain path-style URL (@c "{scheme}://{host}/{bucket}/
+ * {key}", no query auth) plus @c Authorization, @c x-amz-date,
+ * @c x-amz-content-sha256, and @c x-amz-security-token (only for temporary
+ * credentials). For on-prem / S3-compatible stores whose gateways prefer header
+ * auth over presigned query strings. @c timeout is unused (header auth carries
+ * no explicit expiry).
+ */
+class sirius_sigv4_header_authorizer final : public sirius_sigv4_authorizer_base {
+ public:
+  /// @throw sirius::io::credential_error on empty creds/region or malformed
+  ///        endpoint.
+  sirius_sigv4_header_authorizer(static_credentials creds,
+                                 std::string region,
+                                 std::string endpoint);
+
+  /// Thread-safe: @c sigv4::sign_request is pure and members are immutable after
+  /// construction.
+  /// @throw sirius::io::credential_error on empty bucket / key or SigV4 failure.
+  s3_authorized_request authorize(s3_object_ref const& obj,
+                                  s3_request_method method,
+                                  std::chrono::seconds timeout) override;
 };
 
 }  // namespace sirius::io::s3

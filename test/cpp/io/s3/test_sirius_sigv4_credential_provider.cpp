@@ -37,6 +37,7 @@ using sirius::io::s3::mock_request_authorizer;
 using sirius::io::s3::s3_authorized_request;
 using sirius::io::s3::s3_object_ref;
 using sirius::io::s3::s3_request_method;
+using sirius::io::s3::sirius_sigv4_header_authorizer;
 using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 using sirius::io::s3::static_credentials_from;
@@ -80,6 +81,23 @@ bool contains(std::string_view haystack, std::string_view needle)
 bool starts_with(std::string_view s, std::string_view prefix)
 {
   return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
+}
+
+bool ascii_iequals(std::string_view lhs, std::string_view rhs)
+{
+  return lhs.size() == rhs.size() &&
+         std::equal(lhs.begin(), lhs.end(), rhs.begin(), [](unsigned char a, unsigned char b) {
+           return std::tolower(a) == std::tolower(b);
+         });
+}
+
+std::string header_value(std::vector<std::pair<std::string, std::string>> const& headers,
+                         std::string_view name)
+{
+  for (auto const& [key, value] : headers) {
+    if (ascii_iequals(key, name)) { return value; }
+  }
+  return {};
 }
 
 bool is_lower_hex_64(std::string_view value)
@@ -158,6 +176,48 @@ TEST_CASE("sirius_sigv4_presigned_authorizer rejects malformed construction inpu
   CHECK_THROWS_AS(sirius_sigv4_presigned_authorizer(
                     creds, "us-east-1", "https://example.com", std::chrono::seconds{0}),
                   credential_error);
+}
+
+TEST_CASE("sirius_sigv4_header_authorizer signs with headers and plain path-style URLs",
+          "[s3][authorizer]")
+{
+  auto creds          = example_static_credentials();
+  creds.session_token = "temporary/session+token=";
+  sirius_sigv4_header_authorizer provider(creds, "us-east-1", "https://s3.us-east-1.amazonaws.com");
+
+  auto get_request =
+    provider.authorize({"examplebucket", "test.txt"}, s3_request_method::GET, k_presign_timeout);
+  auto head_request =
+    provider.authorize({"examplebucket", "test.txt"}, s3_request_method::HEAD, k_presign_timeout);
+
+  CHECK(get_request.url == "https://s3.us-east-1.amazonaws.com/examplebucket/test.txt");
+  CHECK_FALSE(contains(get_request.url, "X-Amz-Signature"));
+  CHECK_FALSE(contains(get_request.url, "?"));
+
+  auto get_auth = header_value(get_request.headers, "Authorization");
+  REQUIRE(starts_with(get_auth, "AWS4-HMAC-SHA256 "));
+  CHECK_FALSE(header_value(get_request.headers, "x-amz-date").empty());
+  CHECK_FALSE(header_value(get_request.headers, "x-amz-content-sha256").empty());
+  CHECK(header_value(get_request.headers, "x-amz-security-token") == creds.session_token);
+
+  auto head_auth = header_value(head_request.headers, "Authorization");
+  REQUIRE(starts_with(head_auth, "AWS4-HMAC-SHA256 "));
+  CHECK(get_auth != head_auth);
+}
+
+TEST_CASE("sirius_sigv4_header_authorizer omits session-token header for long-lived keys",
+          "[s3][authorizer]")
+{
+  sirius_sigv4_header_authorizer provider(
+    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+
+  auto request = provider.authorize(
+    {"bucket", "nested/object.parquet"}, s3_request_method::GET, std::chrono::seconds{10});
+
+  CHECK(request.url == "http://minio.local:9000/bucket/nested/object.parquet");
+  CHECK_FALSE(contains(request.url, "X-Amz-"));
+  CHECK(starts_with(header_value(request.headers, "Authorization"), "AWS4-HMAC-SHA256 "));
+  CHECK(header_value(request.headers, "x-amz-security-token").empty());
 }
 
 TEST_CASE("sirius_sigv4_presigned_authorizer generates distinct GET and HEAD URLs",

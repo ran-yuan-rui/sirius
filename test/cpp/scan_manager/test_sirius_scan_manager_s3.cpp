@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "io/object_store_config.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/mock_request_authorizer.hpp"
 #include "io/s3/s3_io_object.hpp"
@@ -36,6 +37,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -53,6 +55,7 @@
 #include <vector>
 
 using sirius::io::buffer_pool;
+using sirius::io::object_store_config;
 using sirius::io::sirius_ioctx;
 using sirius::io::s3::mock_request_authorizer;
 using sirius::io::s3::s3_authorized_request;
@@ -442,6 +445,50 @@ TEST_CASE("sirius_scan_manager leaves S3 ioctx cache disabled when prefetch cach
   REQUIRE(s3_ctx != nullptr);
   CHECK(context.get_scan_manager().io_ctx_for(s3_uri(env->bucket, "medium.bin")) == s3_ctx.get());
   CHECK(s3_ctx->cache() == nullptr);
+
+  context.terminate();
+}
+
+TEST_CASE("SiriusContext object_store_config header signing reads MinIO bytes",
+          "[.][s3][integration][scan_manager][authorizer]")
+{
+  auto env = read_s3_test_env();
+  if (!env) {
+    WARN("Skipping S3 header-signing integration because SIRIUS_TEST_S3_* is not configured");
+    return;
+  }
+
+  std::string const key = "small.bin";
+  auto local            = read_binary_file(env->local_dir / key);
+  REQUIRE(local.size() >= 32);
+
+  auto cfg                                = make_context_config("integration_s3cache.yaml");
+  cfg.object_store_config.endpoint        = env->endpoint;
+  cfg.object_store_config.region          = env->region;
+  cfg.object_store_config.access_key      = env->access_key;
+  cfg.object_store_config.secret_key      = env->secret_key;
+  cfg.object_store_config.s3_signing_mode = object_store_config::signing_mode::header;
+
+  auto scan_cfg                              = cfg.get_scan_manager_config();
+  scan_cfg.use_sirius_datasource             = true;
+  scan_cfg.s3_thread_pool.num_threads        = 4;
+  scan_cfg.s3_thread_pool.thread_name_prefix = "s3_header";
+  cfg.set_scan_manager_config(std::move(scan_cfg));
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  auto s3_ctx = context.get_s3_ioctx();
+  REQUIRE(s3_ctx != nullptr);
+  auto* s3 = dynamic_cast<sirius::io::s3::s3_ioctx*>(s3_ctx.get());
+  REQUIRE(s3 != nullptr);
+  auto const size = s3->head_object_size(env->bucket, key);
+  REQUIRE(size == local.size());
+
+  auto obj = make_s3_object(env->bucket, key, size);
+  std::vector<std::uint8_t> got(32);
+  REQUIRE(s3->host_read(*obj, 0, got.size(), got.data()) == got.size());
+  CHECK(std::equal(got.begin(), got.end(), local.begin()));
 
   context.terminate();
 }

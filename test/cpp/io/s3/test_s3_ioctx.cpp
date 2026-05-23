@@ -75,6 +75,7 @@ using sirius::io::s3::s3_ioctx_config;
 using sirius::io::s3::s3_object_ref;
 using sirius::io::s3::s3_request_authorizer;
 using sirius::io::s3::s3_request_method;
+using sirius::io::s3::sirius_sigv4_header_authorizer;
 using sirius::io::s3::sirius_sigv4_presigned_authorizer;
 using sirius::io::s3::static_credentials;
 
@@ -860,6 +861,46 @@ TEST_CASE("s3_ioctx authorizes every HTTP request inline with method and timeout
   CHECK(calls[2].url.find("X-Amz-Signature=fake") != std::string::npos);
   CHECK(requests[2].rfind("GET ", 0) == 0);
   CHECK(requests[2].find("Range: bytes=0-1") != std::string::npos);
+}
+
+TEST_CASE("s3_ioctx attaches SigV4 header authorizations and leaves Range unsigned",
+          "[s3][ioctx][authorizer]")
+{
+  scripted_http_server server({head_ok(6), range_ok_at("cde", 2, 6)});
+
+  static_credentials creds;
+  creds.access_key_id     = "AKIAIOSFODNN7EXAMPLE";
+  creds.secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+  auto provider =
+    std::make_shared<sirius_sigv4_header_authorizer>(std::move(creds), "us-east-1", server.url(""));
+
+  s3_ioctx_config cfg{provider, 1, 7};
+  cfg.max_retry_attempts = 1;
+  auto ctx               = std::make_shared<s3_ioctx>(std::move(cfg));
+
+  CHECK(ctx->head_object_size("bucket", "key") == 6);
+
+  auto obj = make_s3_object("bucket", "key", 6);
+  std::vector<std::uint8_t> middle(3);
+  REQUIRE(ctx->host_read(*obj, 2, middle.size(), middle.data()) == middle.size());
+  CHECK(std::string(middle.begin(), middle.end()) == "cde");
+
+  auto requests = server.requests();
+  REQUIRE(requests.size() == 2);
+
+  CHECK(requests[0].rfind("HEAD /bucket/key HTTP/", 0) == 0);
+  CHECK(requests[0].find("X-Amz-Signature") == std::string::npos);
+  CHECK(requests[0].find("Authorization: AWS4-HMAC-SHA256 ") != std::string::npos);
+  CHECK(requests[0].find("x-amz-date:") != std::string::npos);
+  CHECK(requests[0].find("x-amz-content-sha256:") != std::string::npos);
+  CHECK(requests[0].find("Range:") == std::string::npos);
+
+  CHECK(requests[1].rfind("GET /bucket/key HTTP/", 0) == 0);
+  CHECK(requests[1].find("X-Amz-Signature") == std::string::npos);
+  CHECK(requests[1].find("Authorization: AWS4-HMAC-SHA256 ") != std::string::npos);
+  CHECK(requests[1].find("x-amz-date:") != std::string::npos);
+  CHECK(requests[1].find("x-amz-content-sha256:") != std::string::npos);
+  CHECK(requests[1].find("Range: bytes=2-4") != std::string::npos);
 }
 
 TEST_CASE("s3_ioctx clips physical byte ranges to file size", "[s3][ioctx]")

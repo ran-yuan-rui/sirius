@@ -39,6 +39,13 @@ struct object_store_config {
   /// to choose based on URI scheme and endpoint capabilities.
   enum class transport { AUTO, HTTP, RDMA };
   transport s3_transport = transport::AUTO;
+
+  /// SigV4 signing form for S3 requests. @c presigned puts auth in the URL query
+  /// string (default; works everywhere AWS does). @c header puts auth in the
+  /// @c Authorization header (sign_request) — for on-prem / S3-compatible stores
+  /// whose gateways prefer header auth over long presigned query strings.
+  enum class signing_mode { presigned, header };
+  signing_mode s3_signing_mode = signing_mode::presigned;
 };
 
 inline bool string_to_enum(std::string_view sv, object_store_config::transport& t)
@@ -63,6 +70,29 @@ inline bool enum_to_string(object_store_config::transport t, std::string& s)
     case object_store_config::transport::AUTO: s = "auto"; return true;
     case object_store_config::transport::HTTP: s = "http"; return true;
     case object_store_config::transport::RDMA: s = "rdma"; return true;
+  }
+  return false;
+}
+
+inline bool string_to_enum(std::string_view sv, object_store_config::signing_mode& m)
+{
+  static const std::unordered_map<std::string_view, object_store_config::signing_mode> map = {
+    {"presigned", object_store_config::signing_mode::presigned},
+    {"header", object_store_config::signing_mode::header},
+  };
+  auto it = map.find(sv);
+  if (it != map.end()) {
+    m = it->second;
+    return true;
+  }
+  return false;
+}
+
+inline bool enum_to_string(object_store_config::signing_mode m, std::string& s)
+{
+  switch (m) {
+    case object_store_config::signing_mode::presigned: s = "presigned"; return true;
+    case object_store_config::signing_mode::header: s = "header"; return true;
   }
   return false;
 }
