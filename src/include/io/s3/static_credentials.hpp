@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "io/object_store_config.hpp"
+
 #include <chrono>
 #include <optional>
 #include <string>
@@ -46,5 +48,18 @@ struct static_credentials {
   std::string session_token;
   std::optional<std::chrono::system_clock::time_point> expires_at;
 };
+
+/// Map an @c object_store_config's static-credential fields into a
+/// @c static_credentials snapshot: access key, secret, and (for STS temporary
+/// credentials) session token. @c expires_at is left @c nullopt —
+/// @c object_store_config carries no expiry.
+inline static_credentials static_credentials_from(object_store_config const& cfg)
+{
+  static_credentials creds;
+  creds.access_key_id     = cfg.access_key;
+  creds.secret_access_key = cfg.secret_key;
+  creds.session_token     = cfg.session_token;
+  return creds;
+}
 
 }  // namespace sirius::io::s3

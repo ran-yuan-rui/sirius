@@ -31,6 +31,9 @@ struct object_store_config {
   std::string region;
   std::string access_key;
   std::string secret_key;
+  /// STS temporary-credential session token (empty for long-lived keys). When
+  /// set, the SigV4 signer adds X-Amz-Security-Token to presigned URLs.
+  std::string session_token;
 
   /// Requested S3 transport. AUTO leaves the concrete backend/integration code
   /// to choose based on URI scheme and endpoint capabilities.

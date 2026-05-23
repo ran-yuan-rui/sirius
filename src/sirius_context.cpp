@@ -560,10 +560,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (!config_.object_store_config.endpoint.empty() &&
       !config_.object_store_config.access_key.empty() &&
       !config_.object_store_config.secret_key.empty()) {
-    sirius::io::s3::static_credentials creds;
-    creds.access_key_id     = config_.object_store_config.access_key;
-    creds.secret_access_key = config_.object_store_config.secret_key;
-    auto provider           = std::make_shared<sirius::io::s3::sirius_sigv4_credential_provider>(
+    auto creds    = sirius::io::s3::static_credentials_from(config_.object_store_config);
+    auto provider = std::make_shared<sirius::io::s3::sirius_sigv4_credential_provider>(
       std::move(creds),
       config_.object_store_config.region,
       config_.object_store_config.endpoint,

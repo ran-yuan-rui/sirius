@@ -16,8 +16,10 @@
 
 #include "catch.hpp"
 #include "io/io_errors.hpp"
+#include "io/object_store_config.hpp"
 #include "io/s3/mock_credential_provider.hpp"
 #include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/static_credentials.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -29,11 +31,13 @@
 #include <vector>
 
 using sirius::io::credential_error;
+using sirius::io::object_store_config;
 using sirius::io::s3::mock_credential_provider;
 using sirius::io::s3::presign_method;
 using sirius::io::s3::s3_object_ref;
 using sirius::io::s3::sirius_sigv4_credential_provider;
 using sirius::io::s3::static_credentials;
+using sirius::io::s3::static_credentials_from;
 
 namespace {
 
@@ -204,6 +208,36 @@ TEST_CASE("sirius_sigv4_credential_provider propagates session tokens", "[s3][cr
     {"examplebucket", "test.txt"}, presign_method::GET, k_presign_timeout);
 
   CHECK(contains(url, "X-Amz-Security-Token=temporary%2Fsession%2Btoken%3D"));
+}
+
+TEST_CASE("static_credentials_from maps object_store_config session tokens into SigV4 URLs",
+          "[s3][credential_provider]")
+{
+  object_store_config cfg;
+  cfg.endpoint      = "https://s3.us-east-1.amazonaws.com";
+  cfg.region        = "us-east-1";
+  cfg.access_key    = "AKIAIOSFODNN7EXAMPLE";
+  cfg.secret_key    = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+  cfg.session_token = "temporary/session+token=";
+
+  auto creds = static_credentials_from(cfg);
+  CHECK(creds.access_key_id == cfg.access_key);
+  CHECK(creds.secret_access_key == cfg.secret_key);
+  CHECK(creds.session_token == cfg.session_token);
+
+  sirius_sigv4_credential_provider token_provider(creds, cfg.region, cfg.endpoint);
+  auto token_url = token_provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::GET, k_presign_timeout);
+  CHECK(contains(token_url, "X-Amz-Security-Token=temporary%2Fsession%2Btoken%3D"));
+
+  cfg.session_token.clear();
+  auto no_token_creds = static_credentials_from(cfg);
+  CHECK(no_token_creds.session_token.empty());
+
+  sirius_sigv4_credential_provider no_token_provider(no_token_creds, cfg.region, cfg.endpoint);
+  auto no_token_url = no_token_provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::GET, k_presign_timeout);
+  CHECK_FALSE(contains(no_token_url, "X-Amz-Security-Token="));
 }
 
 TEST_CASE("sirius_sigv4_credential_provider honors per-call timeout", "[s3][credential_provider]")

@@ -34,6 +34,7 @@ TEST_CASE("object_store_config defaults are inert", "[object_store_config]")
   CHECK(cfg.region.empty());
   CHECK(cfg.access_key.empty());
   CHECK(cfg.secret_key.empty());
+  CHECK(cfg.session_token.empty());
   CHECK(cfg.s3_transport == object_store_config::transport::AUTO);
 }
 
@@ -93,6 +94,7 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
            "    region: us-east-1\n"
            "    access_key: minioadmin\n"
            "    secret_key: minioadmin-secret\n"
+           "    session_token: TESTSESSIONTOKEN\n"
            "    s3_transport: rdma\n";
     REQUIRE(out);
   }
@@ -104,6 +106,7 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
   CHECK(cfg.object_store_config.region == "us-east-1");
   CHECK(cfg.object_store_config.access_key == "minioadmin");
   CHECK(cfg.object_store_config.secret_key == "minioadmin-secret");
+  CHECK(cfg.object_store_config.session_token == "TESTSESSIONTOKEN");
   CHECK(cfg.object_store_config.s3_transport == object_store_config::transport::RDMA);
 
   std::error_code ec;
