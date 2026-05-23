@@ -98,7 +98,8 @@ sirius_sigv4_credential_provider::sirius_sigv4_credential_provider(static_creden
 }
 
 std::string sirius_sigv4_credential_provider::get_presigned_url(s3_object_ref const& obj,
-                                                                presign_method method)
+                                                                presign_method method,
+                                                                std::chrono::seconds timeout)
 {
   if (obj.bucket.empty()) {
     throw credential_error("sirius_sigv4_credential_provider: empty bucket");
@@ -129,8 +130,13 @@ std::string sirius_sigv4_credential_provider::get_presigned_url(s3_object_ref co
     case presign_method::HEAD: method_str = "HEAD"; break;
   }
 
+  // Per-call timeout drives X-Amz-Expires; fall back to the construction-time
+  // default TTL when the caller passes a non-positive value (per credential_provider).
+  auto const effective_ttl = timeout.count() > 0 ? timeout : _ttl;
+
   try {
-    return presign_url(method_str, _scheme, _host, canonical_uri, signer, std::time(nullptr), _ttl);
+    return presign_url(
+      method_str, _scheme, _host, canonical_uri, signer, std::time(nullptr), effective_ttl);
   } catch (credential_error const&) {
     throw;
   } catch (std::exception const& e) {

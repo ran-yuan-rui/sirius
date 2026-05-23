@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -80,10 +81,16 @@ class credential_provider {
    * — the presigned URL signs only the @c host header so range / accept /
    * etc. headers may be added unsigned without invalidating the signature.
    *
+   * @param timeout  Per-call URL lifetime (@c X-Amz-Expires). The IO layer sizes
+   *                  it to cover a single request attempt (not the whole
+   *                  scan/task) — URLs are minted inline per request, so a short
+   *                  TTL is safe. Implementations may treat a non-positive value
+   *                  as "use an implementation default".
    * @throw sirius::io::credential_error on credential / signing failure.
    */
   [[nodiscard]] virtual std::string get_presigned_url(s3_object_ref const& obj,
-                                                      presign_method method) = 0;
+                                                      presign_method method,
+                                                      std::chrono::seconds timeout) = 0;
 };
 
 }  // namespace sirius::io::s3

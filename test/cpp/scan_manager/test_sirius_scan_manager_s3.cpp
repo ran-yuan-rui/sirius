@@ -173,10 +173,12 @@ class counting_credential_provider final : public credential_provider {
       std::move(creds), env.region, env.endpoint, 30min);
   }
 
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  std::string get_presigned_url(s3_object_ref const& obj,
+                                presign_method method,
+                                std::chrono::seconds timeout) override
   {
     if (method == presign_method::GET) { _get_count.fetch_add(1, std::memory_order_relaxed); }
-    return _delegate->get_presigned_url(obj, method);
+    return _delegate->get_presigned_url(obj, method, timeout);
   }
 
   [[nodiscard]] int get_count() const noexcept

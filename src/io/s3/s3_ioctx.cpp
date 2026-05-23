@@ -422,6 +422,17 @@ void s3_ioctx::release_handle(handle_slot slot)
 // HEAD / range GET
 // ===========================================================================
 
+// Per-attempt presigned-URL TTL: cover one libcurl request + clock skew, NOT the
+// whole scan/task lifetime (newplan §30.1 / Codex F4). The URL is freshly minted
+// each attempt, so a short TTL limits leaked-URL blast radius. Falls back to
+// 5 min when no per-request curl timeout is configured.
+static std::chrono::seconds presign_ttl_for_attempt(long request_timeout_s)
+{
+  constexpr long kSkewSeconds = 60;
+  long const base             = request_timeout_s > 0 ? request_timeout_s : 300;
+  return std::chrono::seconds{base + kSkewSeconds};
+}
+
 std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view key)
 {
   // Auth lives in the URL's query string (X-Amz-Signature etc.); no
@@ -438,8 +449,10 @@ std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view
 
   for (std::size_t attempt = 1; attempt <= max_attempts; ++attempt) {
     curl_easy_reset(h);
-    std::string url = _cfg.creds->get_presigned_url(
-      s3_object_ref{std::string{bucket}, std::string{key}}, presign_method::HEAD);
+    std::string url =
+      _cfg.creds->get_presigned_url(s3_object_ref{std::string{bucket}, std::string{key}},
+                                    presign_method::HEAD,
+                                    presign_ttl_for_attempt(_cfg.request_timeout_s));
     header_capture hc;
     curl_easy_setopt(h, CURLOPT_URL, url.c_str());
     curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
@@ -500,8 +513,10 @@ std::size_t s3_ioctx::range_get(std::string_view bucket,
     // which the presigned URL deliberately leaves unsigned (SignedHeaders=host
     // only) so callers may add Range / Accept / etc. without breaking the
     // signature.
-    std::string url = _cfg.creds->get_presigned_url(
-      s3_object_ref{std::string{bucket}, std::string{key}}, presign_method::GET);
+    std::string url =
+      _cfg.creds->get_presigned_url(s3_object_ref{std::string{bucket}, std::string{key}},
+                                    presign_method::GET,
+                                    presign_ttl_for_attempt(_cfg.request_timeout_s));
 
     std::ostringstream range_os;
     range_os << "Range: bytes=" << offset << "-" << (offset + size - 1);

@@ -20,6 +20,7 @@
 #include "io/s3/credential_provider.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -56,15 +57,18 @@ class mock_credential_provider final : public credential_provider {
  public:
   explicit mock_credential_provider(std::string url) : _url(std::move(url)) {}
 
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  std::string get_presigned_url(s3_object_ref const& obj,
+                                presign_method method,
+                                std::chrono::seconds timeout) override
   {
     ++_call_count;
     if (method == presign_method::GET) ++_get_count;
     if (method == presign_method::HEAD) ++_head_count;
     {
       std::scoped_lock lk{_last_mtx};
-      _last_bucket = obj.bucket;
-      _last_key    = obj.key;
+      _last_bucket  = obj.bucket;
+      _last_key     = obj.key;
+      _last_timeout = timeout;
     }
     if (_should_throw.load()) {
       std::string msg;
@@ -112,6 +116,11 @@ class mock_credential_provider final : public credential_provider {
     std::scoped_lock lk{_last_mtx};
     return _last_key;
   }
+  [[nodiscard]] std::chrono::seconds last_timeout() const
+  {
+    std::scoped_lock lk{_last_mtx};
+    return _last_timeout;
+  }
 
  private:
   std::string _url;
@@ -122,6 +131,7 @@ class mock_credential_provider final : public credential_provider {
   mutable std::mutex _last_mtx;
   std::string _last_bucket;
   std::string _last_key;
+  std::chrono::seconds _last_timeout{0};
   std::string _throw_msg;
 };
 

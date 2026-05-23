@@ -80,7 +80,9 @@ class sirius_sigv4_credential_provider final : public credential_provider {
    * @throw sirius::io::credential_error on empty bucket / key, or any failure
    *                                     surfaced from the SigV4 layer.
    */
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override;
+  std::string get_presigned_url(s3_object_ref const& obj,
+                                presign_method method,
+                                std::chrono::seconds timeout) override;
 
  private:
   static_credentials _creds;

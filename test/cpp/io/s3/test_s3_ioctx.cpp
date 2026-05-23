@@ -288,7 +288,9 @@ class blocking_throwing_provider final : public credential_provider {
   {
   }
 
-  std::string get_presigned_url(s3_object_ref const&, presign_method method) override
+  std::string get_presigned_url(s3_object_ref const&,
+                                presign_method method,
+                                std::chrono::seconds) override
   {
     _method.store(method == presign_method::GET ? 1 : 2, std::memory_order_relaxed);
     std::call_once(_entered_once, [&] { _entered_promise.set_value(); });
@@ -331,13 +333,15 @@ class blocking_first_get_provider final : public credential_provider {
   {
   }
 
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  std::string get_presigned_url(s3_object_ref const& obj,
+                                presign_method method,
+                                std::chrono::seconds timeout) override
   {
     if (method == presign_method::GET && !_blocked_first_get.exchange(true)) {
       std::call_once(_entered_once, [&] { _entered_promise.set_value(); });
       _release.wait();
     }
-    return _delegate->get_presigned_url(obj, method);
+    return _delegate->get_presigned_url(obj, method, timeout);
   }
 
   bool wait_until_first_get_entered(std::chrono::milliseconds timeout) const
@@ -515,6 +519,38 @@ class scripted_http_server {
   std::thread _thread;
 };
 
+struct presign_observation {
+  std::string bucket;
+  std::string key;
+  presign_method method;
+  std::chrono::seconds timeout;
+};
+
+class recording_scripted_provider final : public credential_provider {
+ public:
+  explicit recording_scripted_provider(std::string url) : _url(std::move(url)) {}
+
+  std::string get_presigned_url(s3_object_ref const& obj,
+                                presign_method method,
+                                std::chrono::seconds timeout) override
+  {
+    std::lock_guard guard(_mutex);
+    _calls.push_back({obj.bucket, obj.key, method, timeout});
+    return _url;
+  }
+
+  [[nodiscard]] std::vector<presign_observation> calls() const
+  {
+    std::lock_guard guard(_mutex);
+    return _calls;
+  }
+
+ private:
+  std::string _url;
+  mutable std::mutex _mutex;
+  std::vector<presign_observation> _calls;
+};
+
 scripted_http_response http_error(long status, std::string reason, std::string body = {})
 {
   return scripted_http_response{status, std::move(reason), {}, std::move(body)};
@@ -568,13 +604,15 @@ class delayed_get_provider final : public credential_provider {
   {
   }
 
-  std::string get_presigned_url(s3_object_ref const& obj, presign_method method) override
+  std::string get_presigned_url(s3_object_ref const& obj,
+                                presign_method method,
+                                std::chrono::seconds timeout) override
   {
     if (method == presign_method::GET) {
       _get_count.fetch_add(1, std::memory_order_relaxed);
       std::this_thread::sleep_for(_delay);
     }
-    return _delegate->get_presigned_url(obj, method);
+    return _delegate->get_presigned_url(obj, method, timeout);
   }
 
   [[nodiscard]] int get_count() const noexcept
@@ -742,6 +780,46 @@ TEST_CASE("s3_ioctx asks credential_provider for method-specific presigned URLs"
   CHECK(provider->get_count() == 1);
   CHECK(provider->last_bucket() == "bucket");
   CHECK(provider->last_key() == "key");
+}
+
+TEST_CASE("s3_ioctx presigns every HTTP request inline with method and timeout",
+          "[s3][ioctx][credential_provider]")
+{
+  scripted_http_server server({head_ok(6), range_ok_at("cde", 2, 6), range_ok_at("ab", 0, 6)});
+  auto provider = std::make_shared<recording_scripted_provider>(server.url());
+  s3_ioctx_config cfg{provider, 1, 7};
+  cfg.max_retry_attempts = 1;
+  auto ctx               = std::make_shared<s3_ioctx>(std::move(cfg));
+
+  CHECK(ctx->head_object_size("bucket", "key") == 6);
+
+  auto obj = make_s3_object("bucket", "key", 6);
+  std::vector<std::uint8_t> middle(3);
+  REQUIRE(ctx->host_read(*obj, 2, middle.size(), middle.data()) == middle.size());
+  CHECK(std::string(middle.begin(), middle.end()) == "cde");
+
+  std::vector<std::uint8_t> head(2);
+  REQUIRE(ctx->host_read(*obj, 0, head.size(), head.data()) == head.size());
+  CHECK(std::string(head.begin(), head.end()) == "ab");
+
+  auto calls = provider->calls();
+  REQUIRE(calls.size() == server.request_count());
+  REQUIRE(calls.size() == 3);
+
+  CHECK(calls[0].bucket == "bucket");
+  CHECK(calls[0].key == "key");
+  CHECK(calls[0].method == presign_method::HEAD);
+  CHECK(calls[0].timeout > std::chrono::seconds{0});
+
+  CHECK(calls[1].bucket == "bucket");
+  CHECK(calls[1].key == "key");
+  CHECK(calls[1].method == presign_method::GET);
+  CHECK(calls[1].timeout > std::chrono::seconds{0});
+
+  CHECK(calls[2].bucket == "bucket");
+  CHECK(calls[2].key == "key");
+  CHECK(calls[2].method == presign_method::GET);
+  CHECK(calls[2].timeout > std::chrono::seconds{0});
 }
 
 TEST_CASE("s3_ioctx clips physical byte ranges to file size", "[s3][ioctx]")

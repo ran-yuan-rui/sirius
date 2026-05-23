@@ -37,6 +37,8 @@ using sirius::io::s3::static_credentials;
 
 namespace {
 
+constexpr auto k_presign_timeout = std::chrono::seconds{300};
+
 static_credentials example_static_credentials()
 {
   static_credentials creds;
@@ -88,7 +90,8 @@ TEST_CASE("sirius_sigv4_credential_provider normalizes HTTPS endpoint", "[s3][cr
   sirius_sigv4_credential_provider provider(
     example_static_credentials(), "us-west-2", "HTTPS://S3.US-WEST-2.AMAZONAWS.COM");
 
-  auto url = provider.get_presigned_url({"examplebucket", "test.txt"}, presign_method::GET);
+  auto url = provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::GET, k_presign_timeout);
 
   CHECK(starts_with(url, "https://s3.us-west-2.amazonaws.com/examplebucket/test.txt?"));
   CHECK(query_value(url, "X-Amz-Credential").find("%2Fus-west-2%2Fs3%2Faws4_request") !=
@@ -102,7 +105,8 @@ TEST_CASE("sirius_sigv4_credential_provider preserves HTTP endpoint ports",
   sirius_sigv4_credential_provider provider(
     example_static_credentials(), "us-east-1", "http://minio.local:9000");
 
-  auto url = provider.get_presigned_url({"bucket", "object.parquet"}, presign_method::GET);
+  auto url = provider.get_presigned_url(
+    {"bucket", "object.parquet"}, presign_method::GET, k_presign_timeout);
 
   CHECK(starts_with(url, "http://minio.local:9000/bucket/object.parquet?"));
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
@@ -153,8 +157,10 @@ TEST_CASE("sirius_sigv4_credential_provider generates distinct GET and HEAD URLs
   sirius_sigv4_credential_provider provider(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
 
-  auto get_url  = provider.get_presigned_url({"examplebucket", "test.txt"}, presign_method::GET);
-  auto head_url = provider.get_presigned_url({"examplebucket", "test.txt"}, presign_method::HEAD);
+  auto get_url = provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::GET, k_presign_timeout);
+  auto head_url = provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::HEAD, k_presign_timeout);
 
   CHECK(query_value(get_url, "X-Amz-SignedHeaders") == "host");
   CHECK(query_value(head_url, "X-Amz-SignedHeaders") == "host");
@@ -167,20 +173,22 @@ TEST_CASE("sirius_sigv4_credential_provider encodes bucket and key path componen
   sirius_sigv4_credential_provider provider(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
 
-  auto spaced =
-    provider.get_presigned_url({"bucket", "path with space.parquet"}, presign_method::GET);
+  auto spaced = provider.get_presigned_url(
+    {"bucket", "path with space.parquet"}, presign_method::GET, k_presign_timeout);
   CHECK(
     starts_with(spaced, "https://s3.us-east-1.amazonaws.com/bucket/path%20with%20space.parquet?"));
 
-  auto nested = provider.get_presigned_url({"bucket", "a/b/c.parquet"}, presign_method::GET);
+  auto nested =
+    provider.get_presigned_url({"bucket", "a/b/c.parquet"}, presign_method::GET, k_presign_timeout);
   CHECK(starts_with(nested, "https://s3.us-east-1.amazonaws.com/bucket/a/b/c.parquet?"));
   CHECK_FALSE(contains(nested, "a%2Fb%2Fc.parquet"));
 
-  auto leading = provider.get_presigned_url({"bucket", "/foo"}, presign_method::GET);
+  auto leading =
+    provider.get_presigned_url({"bucket", "/foo"}, presign_method::GET, k_presign_timeout);
   CHECK(starts_with(leading, "https://s3.us-east-1.amazonaws.com/bucket//foo?"));
 
-  auto unicode_key =
-    provider.get_presigned_url({"bucket", "\xE4\xB8\xAD\xE6\x96\x87.parquet"}, presign_method::GET);
+  auto unicode_key = provider.get_presigned_url(
+    {"bucket", "\xE4\xB8\xAD\xE6\x96\x87.parquet"}, presign_method::GET, k_presign_timeout);
   CHECK(starts_with(unicode_key,
                     "https://s3.us-east-1.amazonaws.com/bucket/%E4%B8%AD%E6%96%87.parquet?"));
 }
@@ -192,28 +200,33 @@ TEST_CASE("sirius_sigv4_credential_provider propagates session tokens", "[s3][cr
   sirius_sigv4_credential_provider provider(
     creds, "us-east-1", "https://s3.us-east-1.amazonaws.com");
 
-  auto url = provider.get_presigned_url({"examplebucket", "test.txt"}, presign_method::GET);
+  auto url = provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::GET, k_presign_timeout);
 
   CHECK(contains(url, "X-Amz-Security-Token=temporary%2Fsession%2Btoken%3D"));
 }
 
-TEST_CASE("sirius_sigv4_credential_provider uses default and explicit ttl",
-          "[s3][credential_provider]")
+TEST_CASE("sirius_sigv4_credential_provider honors per-call timeout", "[s3][credential_provider]")
 {
-  sirius_sigv4_credential_provider default_provider(
-    example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
-  sirius_sigv4_credential_provider explicit_provider(example_static_credentials(),
-                                                     "us-east-1",
-                                                     "https://s3.us-east-1.amazonaws.com",
-                                                     std::chrono::minutes{30});
+  auto creds          = example_static_credentials();
+  creds.session_token = "temporary/session+token=";
+  sirius_sigv4_credential_provider provider(
+    creds, "us-east-1", "https://s3.us-east-1.amazonaws.com", std::chrono::minutes{30});
 
-  auto default_url =
-    default_provider.get_presigned_url({"examplebucket", "test.txt"}, presign_method::GET);
-  auto explicit_url =
-    explicit_provider.get_presigned_url({"examplebucket", "test.txt"}, presign_method::GET);
+  auto short_url = provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::GET, std::chrono::seconds{37});
+  auto long_url = provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::GET, std::chrono::seconds{1800});
+  auto head_url = provider.get_presigned_url(
+    {"examplebucket", "test.txt"}, presign_method::HEAD, std::chrono::seconds{37});
 
-  CHECK(query_value(default_url, "X-Amz-Expires") == "300");
-  CHECK(query_value(explicit_url, "X-Amz-Expires") == "1800");
+  CHECK(query_value(short_url, "X-Amz-Expires") == "37");
+  CHECK(query_value(long_url, "X-Amz-Expires") == "1800");
+  CHECK(starts_with(short_url, "https://s3.us-east-1.amazonaws.com/examplebucket/test.txt?"));
+  CHECK(query_value(short_url, "X-Amz-SignedHeaders") == "host");
+  CHECK(is_lower_hex_64(query_value(short_url, "X-Amz-Signature")));
+  CHECK(query_value(short_url, "X-Amz-Signature") != query_value(head_url, "X-Amz-Signature"));
+  CHECK(contains(short_url, "X-Amz-Security-Token=temporary%2Fsession%2Btoken%3D"));
 }
 
 TEST_CASE("sirius_sigv4_credential_provider rejects empty object references",
@@ -222,10 +235,12 @@ TEST_CASE("sirius_sigv4_credential_provider rejects empty object references",
   sirius_sigv4_credential_provider provider(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
 
-  CHECK_THROWS_AS(provider.get_presigned_url({"", "test.txt"}, presign_method::GET),
-                  credential_error);
-  CHECK_THROWS_AS(provider.get_presigned_url({"bucket", ""}, presign_method::GET),
-                  credential_error);
+  CHECK_THROWS_AS(
+    provider.get_presigned_url({"", "test.txt"}, presign_method::GET, k_presign_timeout),
+    credential_error);
+  CHECK_THROWS_AS(
+    provider.get_presigned_url({"bucket", ""}, presign_method::GET, k_presign_timeout),
+    credential_error);
 }
 
 TEST_CASE("sirius_sigv4_credential_provider is safe under concurrent presigning",
@@ -244,7 +259,8 @@ TEST_CASE("sirius_sigv4_credential_provider is safe under concurrent presigning"
     threads.emplace_back([&provider, &malformed, t] {
       for (int i = 0; i < n_iters; ++i) {
         auto url = provider.get_presigned_url({"bucket", "key-" + std::to_string(t) + ".parquet"},
-                                              presign_method::GET);
+                                              presign_method::GET,
+                                              k_presign_timeout);
         if (!starts_with(url, "https://s3.us-east-1.amazonaws.com/bucket/key-") ||
             query_value(url, "X-Amz-SignedHeaders") != "host" ||
             !is_lower_hex_64(query_value(url, "X-Amz-Signature"))) {
@@ -266,10 +282,11 @@ TEST_CASE("mock_credential_provider returns canned URLs and records calls",
 {
   mock_credential_provider provider("https://signed.example/object");
 
-  CHECK(provider.get_presigned_url({"bucket", "key"}, presign_method::GET) ==
+  CHECK(provider.get_presigned_url({"bucket", "key"}, presign_method::GET, k_presign_timeout) ==
         "https://signed.example/object");
-  CHECK(provider.get_presigned_url({"bucket", "head-key"}, presign_method::HEAD) ==
-        "https://signed.example/object");
+  CHECK(provider.get_presigned_url({"bucket", "head-key"},
+                                   presign_method::HEAD,
+                                   k_presign_timeout) == "https://signed.example/object");
 
   CHECK(provider.call_count() == 2);
   CHECK(provider.get_count() == 1);
@@ -283,10 +300,11 @@ TEST_CASE("mock_credential_provider can force credential errors", "[s3][credenti
   mock_credential_provider provider("https://signed.example/object");
   provider.set_throw("boom");
 
-  CHECK_THROWS_AS(provider.get_presigned_url({"bucket", "key"}, presign_method::GET),
-                  credential_error);
+  CHECK_THROWS_AS(
+    provider.get_presigned_url({"bucket", "key"}, presign_method::GET, k_presign_timeout),
+    credential_error);
 
   provider.clear_throw();
-  CHECK(provider.get_presigned_url({"bucket", "key"}, presign_method::GET) ==
+  CHECK(provider.get_presigned_url({"bucket", "key"}, presign_method::GET, k_presign_timeout) ==
         "https://signed.example/object");
 }
