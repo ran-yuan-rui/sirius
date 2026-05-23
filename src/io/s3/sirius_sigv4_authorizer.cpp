@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 
 #include "io/io_errors.hpp"
 #include "io/s3/sigv4.hpp"
@@ -44,17 +44,17 @@ std::string to_lower(std::string_view s)
 std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
 {
   if (endpoint.empty()) {
-    throw credential_error("sirius_sigv4_credential_provider: empty endpoint");
+    throw credential_error("sirius_sigv4_presigned_authorizer: empty endpoint");
   }
   auto sep = endpoint.find("://");
   if (sep == std::string_view::npos) {
     throw credential_error(
-      "sirius_sigv4_credential_provider: endpoint missing scheme (expected http:// or https://)");
+      "sirius_sigv4_presigned_authorizer: endpoint missing scheme (expected http:// or https://)");
   }
   std::string scheme = to_lower(endpoint.substr(0, sep));
   if (scheme != "http" && scheme != "https") {
     throw credential_error(
-      "sirius_sigv4_credential_provider: endpoint scheme must be http or https (got '" + scheme +
+      "sirius_sigv4_presigned_authorizer: endpoint scheme must be http or https (got '" + scheme +
       "')");
   }
   std::string remainder{endpoint.substr(sep + 3)};
@@ -63,33 +63,34 @@ std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
   auto bad = remainder.find_first_of("/?#");
   if (bad != std::string::npos) {
     throw credential_error(
-      "sirius_sigv4_credential_provider: endpoint must be scheme://host[:port] only (got "
+      "sirius_sigv4_presigned_authorizer: endpoint must be scheme://host[:port] only (got "
       "trailing '" +
       remainder.substr(bad) + "')");
   }
   if (remainder.empty()) {
-    throw credential_error("sirius_sigv4_credential_provider: endpoint missing host");
+    throw credential_error("sirius_sigv4_presigned_authorizer: endpoint missing host");
   }
   return {std::move(scheme), to_lower(remainder)};
 }
 
 }  // namespace
 
-sirius_sigv4_credential_provider::sirius_sigv4_credential_provider(static_credentials creds,
-                                                                   std::string region,
-                                                                   std::string endpoint,
-                                                                   std::chrono::seconds default_ttl)
+sirius_sigv4_presigned_authorizer::sirius_sigv4_presigned_authorizer(
+  static_credentials creds,
+  std::string region,
+  std::string endpoint,
+  std::chrono::seconds default_ttl)
   : _creds(std::move(creds)), _region(std::move(region)), _ttl(default_ttl)
 {
   if (_creds.access_key_id.empty() || _creds.secret_access_key.empty()) {
     throw credential_error(
-      "sirius_sigv4_credential_provider: access_key_id and secret_access_key must be non-empty");
+      "sirius_sigv4_presigned_authorizer: access_key_id and secret_access_key must be non-empty");
   }
   if (_region.empty()) {
-    throw credential_error("sirius_sigv4_credential_provider: region must be non-empty");
+    throw credential_error("sirius_sigv4_presigned_authorizer: region must be non-empty");
   }
   if (_ttl.count() <= 0) {
-    throw credential_error("sirius_sigv4_credential_provider: default_ttl must be positive");
+    throw credential_error("sirius_sigv4_presigned_authorizer: default_ttl must be positive");
   }
 
   auto [scheme, host] = parse_endpoint(endpoint);
@@ -97,14 +98,14 @@ sirius_sigv4_credential_provider::sirius_sigv4_credential_provider(static_creden
   _host               = std::move(host);
 }
 
-std::string sirius_sigv4_credential_provider::get_presigned_url(s3_object_ref const& obj,
-                                                                presign_method method,
-                                                                std::chrono::seconds timeout)
+s3_authorized_request sirius_sigv4_presigned_authorizer::authorize(s3_object_ref const& obj,
+                                                                   s3_request_method method,
+                                                                   std::chrono::seconds timeout)
 {
   if (obj.bucket.empty()) {
-    throw credential_error("sirius_sigv4_credential_provider: empty bucket");
+    throw credential_error("sirius_sigv4_presigned_authorizer: empty bucket");
   }
-  if (obj.key.empty()) { throw credential_error("sirius_sigv4_credential_provider: empty key"); }
+  if (obj.key.empty()) { throw credential_error("sirius_sigv4_presigned_authorizer: empty key"); }
 
   // Path-style URL: /<bucket>/<key>. Bucket is encoded with encode_slash=true
   // (no slash valid in bucket names anyway); key is encoded with
@@ -126,21 +127,26 @@ std::string sirius_sigv4_credential_provider::get_presigned_url(s3_object_ref co
 
   std::string_view method_str;
   switch (method) {
-    case presign_method::GET: method_str = "GET"; break;
-    case presign_method::HEAD: method_str = "HEAD"; break;
+    case s3_request_method::GET: method_str = "GET"; break;
+    case s3_request_method::HEAD: method_str = "HEAD"; break;
   }
 
   // Per-call timeout drives X-Amz-Expires; fall back to the construction-time
-  // default TTL when the caller passes a non-positive value (per credential_provider).
+  // default TTL when the caller passes a non-positive value (per
+  // s3_request_authorizer).
   auto const effective_ttl = timeout.count() > 0 ? timeout : _ttl;
 
   try {
-    return presign_url(
-      method_str, _scheme, _host, canonical_uri, signer, std::time(nullptr), effective_ttl);
+    // Presigned authorizer: auth lives entirely in the URL query, so the
+    // produced URL is returned with EMPTY headers.
+    return s3_authorized_request{
+      presign_url(
+        method_str, _scheme, _host, canonical_uri, signer, std::time(nullptr), effective_ttl),
+      {}};
   } catch (credential_error const&) {
     throw;
   } catch (std::exception const& e) {
-    throw credential_error(std::string("sirius_sigv4_credential_provider: ") + e.what());
+    throw credential_error(std::string("sirius_sigv4_presigned_authorizer: ") + e.what());
   }
 }
 

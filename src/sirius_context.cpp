@@ -25,7 +25,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/s3/s3_ioctx.hpp"
-#include "io/s3/sirius_sigv4_credential_provider.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 #include "log/logging.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
@@ -561,7 +561,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       !config_.object_store_config.access_key.empty() &&
       !config_.object_store_config.secret_key.empty()) {
     auto creds    = sirius::io::s3::static_credentials_from(config_.object_store_config);
-    auto provider = std::make_shared<sirius::io::s3::sirius_sigv4_credential_provider>(
+    auto provider = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
       std::move(creds),
       config_.object_store_config.region,
       config_.object_store_config.endpoint,

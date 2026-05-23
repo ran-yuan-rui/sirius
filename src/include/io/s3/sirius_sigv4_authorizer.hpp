@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "io/s3/credential_provider.hpp"
+#include "io/s3/s3_request_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 
 #include <chrono>
@@ -25,7 +25,7 @@
 namespace sirius::io::s3 {
 
 /**
- * @brief Default @c credential_provider implementation: hand-rolled SigV4
+ * @brief Default @c s3_request_authorizer implementation: hand-rolled SigV4
  *        over static credentials.
  *
  * Wraps the @c sirius::io::s3::sigv4 module to produce presigned URLs without
@@ -33,14 +33,14 @@ namespace sirius::io::s3 {
  *   - production with long-lived access keys (typical SET s3_access_key /
  *     s3_secret_key flow),
  *   - production with externally-rotated temporary credentials (caller
- *     reconstructs the provider on rotation; this impl does not refresh).
+ *     reconstructs the authorizer on rotation; this impl does not refresh).
  *
  * Downstream projects that want refresh-aware credentials (IMDS / STS chain /
- * SSO) should ship their own @c credential_provider implementation; the
- * public surface is presign-only so they can do so without exposing raw keys
- * to Sirius.
+ * SSO) should ship their own @c s3_request_authorizer implementation; the
+ * public surface is a single @c authorize() call so they can do so without
+ * exposing raw keys to Sirius.
  */
-class sirius_sigv4_credential_provider final : public credential_provider {
+class sirius_sigv4_presigned_authorizer final : public s3_request_authorizer {
  public:
   /**
    * @brief Construct with static credentials, signing scope, endpoint, and
@@ -64,25 +64,27 @@ class sirius_sigv4_credential_provider final : public credential_provider {
    *                                     non-positive @p default_ttl, or
    *                                     malformed endpoint.
    */
-  sirius_sigv4_credential_provider(static_credentials creds,
-                                   std::string region,
-                                   std::string endpoint,
-                                   std::chrono::seconds default_ttl = std::chrono::minutes{5});
+  sirius_sigv4_presigned_authorizer(static_credentials creds,
+                                    std::string region,
+                                    std::string endpoint,
+                                    std::chrono::seconds default_ttl = std::chrono::minutes{5});
 
   /**
-   * @brief Generate a SigV4 presigned URL for path-style S3 access:
-   *        @c "{scheme}://{host}/{bucket}/{key}?X-Amz-...".
+   * @brief Authorize a request via a SigV4 presigned URL for path-style S3
+   *        access: @c "{scheme}://{host}/{bucket}/{key}?X-Amz-...". The
+   *        returned @c s3_authorized_request carries the presigned URL with
+   *        empty headers (auth lives in the URL query).
    *
    * Thread-safe: the underlying @c sigv4::presign_url is pure (no shared
-   * mutable state) and this provider's members are immutable after
+   * mutable state) and this authorizer's members are immutable after
    * construction.
    *
    * @throw sirius::io::credential_error on empty bucket / key, or any failure
    *                                     surfaced from the SigV4 layer.
    */
-  std::string get_presigned_url(s3_object_ref const& obj,
-                                presign_method method,
-                                std::chrono::seconds timeout) override;
+  s3_authorized_request authorize(s3_object_ref const& obj,
+                                  s3_request_method method,
+                                  std::chrono::seconds timeout) override;
 
  private:
   static_credentials _creds;

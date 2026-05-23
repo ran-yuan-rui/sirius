@@ -175,7 +175,7 @@ set(EXTENSION_SOURCES
     src/io/s3/s3_ioctx.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_s3_filesystem.cpp
-    src/io/s3/sirius_sigv4_credential_provider.cpp
+    src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/sirius_datasource.cpp
     src/io/uri_parser.cpp
     src/io/uring/uring_ioctx.cpp
