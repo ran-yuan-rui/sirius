@@ -68,6 +68,7 @@ extern "C" int cudaProfilerStop();
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
+#include "sirius_sql_rewrite.hpp"
 #include "util/segfault_backtrace.hpp"
 
 // PinTableFunction routes parquet reads through the per-GPU sirius_ioctx
@@ -80,8 +81,9 @@ extern "C" int cudaProfilerStop();
 // <blockingconcurrentqueue.h> (used by spdlog / pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
-#include "io/types.hpp"                // sirius::io::sirius_ioctx
-#include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
+#include "io/s3/sirius_s3_filesystem.hpp"  // sirius::io::s3::sirius_s3_filesystem
+#include "io/types.hpp"                    // sirius::io::sirius_ioctx
+#include "io/uring/uring_reactor.hpp"      // sirius::io::uring_io_object
 
 #include <cstdlib>
 #include <unordered_map>
@@ -107,7 +109,56 @@ unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
   return connection.Query(query);
 }
 
+// Bind callback for the sirius_read_parquet table function — a thin forwarder.
+// It resolves the URI to the connection's scan_manager and probes the parquet
+// footer through describe_parquet (footer-only, no full-file download), then
+// hands the inferred schema back to DuckDB. Bind data carries the URI and
+// footer row count so the cardinality callback can expose a real estimate to
+// the optimizer; the pipeline converter still reads the URI from parameters[0].
+unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
+                                               TableFunctionBindInput& input,
+                                               vector<LogicalType>& return_types,
+                                               vector<string>& names)
+{
+  if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
+    throw std::runtime_error("sirius_read_parquet expects a single non-null parquet URI");
+  }
+  auto const uri = input.inputs[0].GetValue<std::string>();
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw std::runtime_error("sirius_read_parquet: Sirius is not initialized on this connection");
+  }
+
+  auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
+  return_types     = std::move(bind_result.return_types);
+  names            = std::move(bind_result.names);
+  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows);
+}
+
+// Execute callback for sirius_read_parquet. The real scan runs through the
+// Sirius GPU pipeline; this table function is an internal rewrite target for
+// read_parquet('s3://...') inside gpu_execution, NOT a user-facing function.
+// A direct DuckDB (CPU) execution is rejected cleanly — query S3 Parquet via
+// read_parquet('s3://...'), which the bind-time rewrite routes here for the GPU
+// path and which the CPU fallback replays through sirius_s3_filesystem.
+void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
+{
+  throw std::runtime_error(
+    "sirius_read_parquet is an internal rewrite target; query S3 Parquet with "
+    "read_parquet('s3://...') inside gpu_execution()");
+}
+
 }  // namespace
+
+unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
+                                                        FunctionData const* bind_data_p)
+{
+  if (bind_data_p == nullptr) { return nullptr; }
+  auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
+  if (typed == nullptr) { return nullptr; }
+  return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
+}
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
@@ -116,6 +167,13 @@ struct SiriusTableFunctionData : public TableFunctionData {
   unique_ptr<Connection> conn;
   unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
+  // Pre-rewrite query used for the CPU fallback. The GPU path runs the rewritten
+  // `query` (read_parquet('s3://…') -> sirius_read_parquet('s3://…')), which
+  // throws if executed on the CPU. A fallback must instead replay the original
+  // read_parquet('s3://…'), which DuckDB's CPU reader serves through the
+  // registered sirius_s3_filesystem (newplan §29). For local / non-s3 queries
+  // the rewrite is a no-op, so this equals `query`.
+  string cpu_fallback_query;
   bool enable_optimizer;
   bool finished   = false;
   bool plan_error = false;
@@ -459,6 +517,17 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
 
+  // Route Sirius-owned remote parquet reads through Sirius's own bind:
+  // read_parquet('s3://…') -> sirius_read_parquet('s3://…'). DuckDB core has no
+  // S3 filesystem, so without this rewrite the s3:// bind fails before Sirius
+  // ever runs. Local paths and non-s3 calls are left untouched.
+  //
+  // Capture the pre-rewrite query first: a CPU fallback must replay the original
+  // read_parquet('s3://…') (served by sirius_s3_filesystem on the CPU path), not
+  // the rewritten sirius_read_parquet, which throws off the GPU.
+  result->cpu_fallback_query = result->query;
+  result->query              = sirius::rewrite_sirius_owned_remote_parquet_calls(result->query);
+
   // Parse the query just to get the result type information and to create PreparedStatementData
   Parser parser(context.GetParserOptions());
   parser.ParseQuery(result->query);
@@ -515,7 +584,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       printf(
         "=============================================\nError in SiriusExecuteQuery, fallback to "
         "DuckDB\n=============================================\n");
-      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
+      data.res = run_internal_cpu_fallback_query(context, *data.conn, data.cpu_fallback_query);
     } else {
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
@@ -525,7 +594,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
             "to DuckDB\n=============================================\n");
-          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.query);
+          data.res = run_internal_cpu_fallback_query(context, *data.conn, data.cpu_fallback_query);
         } else {
           throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
           return;
@@ -1106,6 +1175,19 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
 
+  // Sirius-owned S3 parquet entry point. gpu_execution rewrites
+  // read_parquet('s3://...') to this table function so the bind runs through
+  // Sirius's footer-only S3 path instead of DuckDB's native read_parquet.
+  // Registered so the rewrite's output binds, but INTERNAL — not a public
+  // surface: users query S3 Parquet with read_parquet('s3://...'), not this.
+  TableFunction sirius_read_parquet("sirius_read_parquet",
+                                    {LogicalType::VARCHAR},
+                                    SiriusReadParquetFunction,
+                                    SiriusReadParquetBind);
+  sirius_read_parquet.cardinality = SiriusReadParquetCardinality;
+  CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
+  catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
+
   TableFunction set_query_label("sirius_set_query_label",
                                 {LogicalType::VARCHAR},
                                 SiriusSetQueryLabelFunction,
@@ -1546,6 +1628,12 @@ static void LoadInternal(ExtensionLoader& loader)
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
   SiriusExtension::RegisterGPUFunctions(db);
+
+  // Register the s3:// FileSystem subsystem so DuckDB's CPU read_parquet can
+  // read S3 parquet through Sirius's s3_ioctx (the S3 execution CPU fallback;
+  // newplan §29). Stateless: it resolves the per-connection s3_ioctx via the
+  // FileOpener -> ClientContext -> SiriusContext at OpenFile time.
+  db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_s3_filesystem>());
 
   // Register optimizer extension for transparent GPU execution.
   // Pre-hook disables incompatible optimizers; post-hook captures the plan.
