@@ -228,6 +228,16 @@ class SiriusContext : public ClientContextState {
   ///        must not extend its lifetime past terminate().
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_ioctx> get_s3_ioctx() const { return s3_ioctx_; }
 
+  /// @brief The SiriusContext-owned prefetch buffer_pool, or nullptr when the
+  ///        prefetch cache was not allocated (S5 three-state resolved to off:
+  ///        explicit @c enable_prefetch_cache: false, or unset with no S3
+  ///        backend). Non-owning view; lifetime tied to SiriusContext — callers
+  ///        must not hold the pointer past terminate().
+  [[nodiscard]] const sirius::io::buffer_pool* get_prefetch_buffer_pool() const
+  {
+    return prefetch_buffer_pool_.get();
+  }
+
   /// @brief Read-only access to the datasource registry populated at startup.
   /// @details kFileScheme is registered at the end of initialize() against
   ///          the lowest-numbered GPU's sirius_ioctx; object-store schemes

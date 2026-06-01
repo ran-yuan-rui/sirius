@@ -154,8 +154,12 @@ struct sirius_memory_limits {
   std::string gpu_reservation{"128 MiB"};
   std::string host_capacity{"512 MiB"};
   std::string disk_capacity;
+  std::optional<bool> enable_prefetch_cache;
   std::optional<bool> enable_chunk_prewarm;
+  std::optional<std::string> prefetch_buffer_pool_bytes;
 };
+
+constexpr std::string_view kS5SmallPrefetchPoolBytes = "512 MiB";
 
 sirius_memory_limits large_sirius_memory_limits()
 {
@@ -167,20 +171,59 @@ sirius_memory_limits large_sirius_memory_limits()
   // disk tier so the large correctness tests exercise Sirius tiering instead
   // of failing at the no-disk spill boundary.
   limits.disk_capacity = "32 GiB";
+  // S5 makes S3 cache default-on. Keep large-test contexts bounded instead of
+  // letting them allocate the production 20 GiB default pinned pool.
+  limits.prefetch_buffer_pool_bytes = std::string{kS5SmallPrefetchPoolBytes};
+  return limits;
+}
+
+sirius_memory_limits large_sirius_memory_limits_cache_off()
+{
+  auto limits                  = large_sirius_memory_limits();
+  limits.enable_prefetch_cache = false;
+  limits.enable_chunk_prewarm  = std::nullopt;
+  return limits;
+}
+
+sirius_memory_limits large_sirius_memory_limits_cache_effect()
+{
+  auto limits                       = large_sirius_memory_limits();
+  limits.host_capacity              = "12 GiB";
+  limits.prefetch_buffer_pool_bytes = "3 GiB";
+  limits.enable_prefetch_cache      = std::nullopt;
+  limits.enable_chunk_prewarm       = std::nullopt;
+  return limits;
+}
+
+sirius_memory_limits large_sirius_memory_limits_cache_effect_off()
+{
+  auto limits                  = large_sirius_memory_limits_cache_effect();
+  limits.enable_prefetch_cache = false;
+  limits.enable_chunk_prewarm  = std::nullopt;
+  return limits;
+}
+
+sirius_memory_limits large_sirius_memory_limits_cache_effect_without_chunk_prewarm()
+{
+  auto limits                  = large_sirius_memory_limits_cache_effect();
+  limits.enable_prefetch_cache = true;
+  limits.enable_chunk_prewarm  = false;
   return limits;
 }
 
 sirius_memory_limits large_sirius_memory_limits_without_chunk_prewarm()
 {
-  auto limits                 = large_sirius_memory_limits();
-  limits.enable_chunk_prewarm = false;
+  auto limits                  = large_sirius_memory_limits();
+  limits.enable_prefetch_cache = true;
+  limits.enable_chunk_prewarm  = false;
   return limits;
 }
 
 sirius_memory_limits large_sirius_memory_limits_with_chunk_prewarm(bool enabled)
 {
-  auto limits                 = large_sirius_memory_limits();
-  limits.enable_chunk_prewarm = enabled;
+  auto limits                  = large_sirius_memory_limits();
+  limits.enable_prefetch_cache = true;
+  limits.enable_chunk_prewarm  = enabled;
   return limits;
 }
 
@@ -263,12 +306,21 @@ class sirius_config_env_guard {
     if (signing_mode.has_value()) {
       out << "    signing_mode: " << yaml_quote(*signing_mode) << "\n";
     }
-    if (limits.enable_chunk_prewarm.has_value()) {
+    if (limits.enable_prefetch_cache.has_value() || limits.enable_chunk_prewarm.has_value() ||
+        limits.prefetch_buffer_pool_bytes.has_value()) {
       out << "  executor:\n"
-             "    scan_manager:\n"
-             "      enable_prefetch_cache: true\n"
-             "      enable_chunk_prewarm: "
-          << (*limits.enable_chunk_prewarm ? "true" : "false") << "\n";
+             "    scan_manager:\n";
+      if (limits.enable_prefetch_cache.has_value()) {
+        out << "      enable_prefetch_cache: " << (*limits.enable_prefetch_cache ? "true" : "false")
+            << "\n";
+      }
+      if (limits.enable_chunk_prewarm.has_value()) {
+        out << "      enable_chunk_prewarm: " << (*limits.enable_chunk_prewarm ? "true" : "false")
+            << "\n";
+      }
+      if (limits.prefetch_buffer_pool_bytes.has_value()) {
+        out << "      prefetch_buffer_pool_bytes: " << *limits.prefetch_buffer_pool_bytes << "\n";
+      }
     }
     out.close();
     REQUIRE(out);
@@ -684,6 +736,79 @@ struct b1_metrics {
   b1_cache_counters cache;
 };
 
+std::uint64_t total_cache_hits(b1_cache_counters const& counters)
+{
+  return counters.hit_count + counters.hit_after_wait;
+}
+
+bool has_only_residual_range_misses(b1_cache_counters const& counters)
+{
+  // The SF10 SQL scan can issue a small number of non-column-chunk subranges
+  // after the split-provider prewarm. Those misses are tiny relative to the
+  // object-size byte guard; a large value here would mean the prewarm ranges
+  // stopped aligning with the scan task.
+  constexpr std::uint64_t kMaxResidualRangeMisses = 32;
+  return counters.range_miss <= kMaxResidualRangeMisses;
+}
+
+double single_numeric_result(duckdb::MaterializedQueryResult& result)
+{
+  REQUIRE(result.RowCount() == 1);
+  REQUIRE(result.ColumnCount() == 1);
+  return std::stod(result.GetValue(0, 0).ToString());
+}
+
+std::string large_lineitem_cache_effect_query(std::string const& lineitem_scan)
+{
+  return "SELECT sum(l_extendedprice * (1 - l_discount)) FROM " + lineitem_scan;
+}
+
+double large_lineitem_cache_effect_oracle(fs::path const& local_path)
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto result =
+    require_query_ok(con, large_lineitem_cache_effect_query(local_parquet_file_scan(local_path)));
+  return single_numeric_result(*result);
+}
+
+struct s5_cache_effect_metrics {
+  double value{0};
+  double wall_clock_ms{0};
+  std::uint64_t bytes_read{0};
+  std::uint64_t fsmr_borrows{0};
+  bool has_cache{false};
+  b1_cache_counters cache;
+};
+
+s5_cache_effect_metrics run_s5_cache_effect_query(s3_sql_fixture& fixture,
+                                                  std::string const& uri,
+                                                  std::string const& sql)
+{
+  auto& s3_ctx              = require_s3_ioctx(fixture, uri);
+  auto* cache               = s3_ctx.cache();
+  auto const before_bytes   = s3_ctx.bytes_read_total();
+  auto const before_borrows = s3_ctx.fsmr_borrows_total();
+  auto const before_cache   = cache ? std::optional{snapshot_cache(*cache)} : std::nullopt;
+
+  auto const start = std::chrono::steady_clock::now();
+  auto result      = require_query_ok(fixture.con, gpu_execution_sql(sql));
+  auto const stop  = std::chrono::steady_clock::now();
+
+  auto const after_cache = cache ? std::optional{snapshot_cache(*cache)} : std::nullopt;
+  auto cache_delta       = b1_cache_counters{};
+  if (before_cache && after_cache) { cache_delta = *after_cache - *before_cache; }
+
+  return s5_cache_effect_metrics{
+    single_numeric_result(*result),
+    std::chrono::duration<double, std::milli>(stop - start).count(),
+    s3_ctx.bytes_read_total() - before_bytes,
+    s3_ctx.fsmr_borrows_total() - before_borrows,
+    cache != nullptr,
+    cache_delta,
+  };
+}
+
 struct b1_run_record {
   std::string query;
   std::string config;
@@ -848,7 +973,7 @@ constexpr std::array<std::string_view, 4> b1_query_names{
 
 std::string b1_config_label(std::string_view config)
 {
-  if (config == kB1CacheOffConfig) { return "cache OFF (production default)"; }
+  if (config == kB1CacheOffConfig) { return "cache OFF (explicit opt-out)"; }
   if (config == kB1CacheOnPrewarmOn) { return "cache ON + prewarm ON"; }
   if (config == kB1CacheOnPrewarmOff) { return "cache ON + prewarm OFF"; }
   return std::string{config};
@@ -967,7 +1092,7 @@ void write_b1_bench_markdown(fs::path const& path,
         << partial_miss << "|" << full_miss << "|" << range_miss << "|\n";
   }
 
-  out << "\n## Cache OFF (production default)\n\n"
+  out << "\n## Cache OFF (explicit opt-out)\n\n"
       << "| query | wall_clock_ms median [min, max] | bytes_read / object_size | "
          "fsmr_borrows_total median [min, max] |\n"
       << "|---|---:|---:|---:|\n";
@@ -1452,6 +1577,139 @@ TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups",
   CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
 }
 
+TEST_CASE("S3 prefetch cache defaults on and prewarm serves projected column reads",
+          "[.][s3][sql][large][large-prefetch-on][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  std::size_t object_size = 0;
+  double expected         = 0.0;
+  s5_cache_effect_metrics off_metrics;
+
+  {
+    s3_sql_fixture fixture(*env, large_sirius_memory_limits_cache_effect_off());
+    auto large = read_large_lineitem_fixture(fixture, *env);
+    if (!large) { return; }
+    object_size = large->object_size;
+    expected    = large_lineitem_cache_effect_oracle(large->local_path);
+
+    off_metrics = run_s5_cache_effect_query(
+      fixture, large->uri, large_lineitem_cache_effect_query(s3_large_lineitem_scan(*env)));
+    CHECK_FALSE(off_metrics.has_cache);
+    CHECK(off_metrics.value == Approx(expected).epsilon(1e-10).margin(1e-5));
+    CHECK(off_metrics.bytes_read > 0);
+    INFO("cache-off byte_delta=" << off_metrics.bytes_read << " object_size=" << object_size);
+    CHECK(within_large_s3_byte_budget(off_metrics.bytes_read, object_size));
+    CHECK(off_metrics.fsmr_borrows > 0);
+  }
+
+  {
+    // enable_prefetch_cache deliberately omitted: S5 resolves the unset value
+    // to ON because object_store_config builds an S3 backend. The 3 GiB
+    // cache-effect pool is large enough to retain the SF10 lineitem object.
+    s3_sql_fixture fixture(*env, large_sirius_memory_limits_cache_effect());
+    auto large = read_large_lineitem_fixture(fixture, *env);
+    if (!large) { return; }
+    REQUIRE(large->object_size == object_size);
+
+    auto on_metrics = run_s5_cache_effect_query(
+      fixture, large->uri, large_lineitem_cache_effect_query(s3_large_lineitem_scan(*env)));
+    REQUIRE(on_metrics.has_cache);
+    CHECK(on_metrics.value == Approx(expected).epsilon(1e-10).margin(1e-5));
+    CHECK(on_metrics.bytes_read > 0);
+    INFO("cache-on byte_delta=" << on_metrics.bytes_read << " object_size=" << object_size);
+    CHECK(within_large_s3_byte_budget(on_metrics.bytes_read, object_size));
+    CHECK(total_cache_hits(on_metrics.cache) > 0);
+    INFO("range_miss=" << on_metrics.cache.range_miss << " hit_count=" << on_metrics.cache.hit_count
+                       << " hit_after_wait=" << on_metrics.cache.hit_after_wait);
+    CHECK(has_only_residual_range_misses(on_metrics.cache));
+    CHECK(on_metrics.fsmr_borrows < off_metrics.fsmr_borrows);
+  }
+}
+
+TEST_CASE("S3 prefetch cache without chunk prewarm preserves correctness and byte budget",
+          "[.][s3][sql][large][large-prefetch-off][gpu_execution][integration]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits_cache_effect_without_chunk_prewarm());
+  auto large = read_large_lineitem_fixture(fixture, *env);
+  if (!large) { return; }
+  auto& s3_ctx = require_s3_ioctx(fixture, large->uri);
+  REQUIRE(s3_ctx.cache() != nullptr);
+
+  auto const expected = large_lineitem_cache_effect_oracle(large->local_path);
+  auto const query    = large_lineitem_cache_effect_query(s3_large_lineitem_scan(*env));
+
+  auto first = run_s5_cache_effect_query(fixture, large->uri, query);
+  REQUIRE(first.has_cache);
+  CHECK(first.value == Approx(expected).epsilon(1e-10).margin(1e-5));
+  CHECK(first.bytes_read > 0);
+  INFO("first_pass_bytes=" << first.bytes_read << " object_size=" << large->object_size);
+  CHECK(within_no_prewarm_s3_byte_budget(first.bytes_read, large->object_size));
+  // enable_chunk_prewarm=false is metadata-only cache mode. It preserves
+  // footer/metadata reuse and the byte-budget guard, but does not promise
+  // read-through caching for column chunks.
+  INFO("prewarm_off_hits=" << total_cache_hits(first.cache)
+                           << " range_miss=" << first.cache.range_miss);
+}
+
+TEST_CASE("AWS live S3 prefetch cache modes preserve correctness and byte guards",
+          "[.][s3][aws][live][cache]")
+{
+  auto env = require_aws_live_env();
+  if (!env) { return; }
+
+  auto run_mode = [&](sirius_memory_limits limits, bool expect_cache, bool second_pass) {
+    s3_sql_fixture fixture(*env, std::move(limits));
+    auto large = read_large_lineitem_fixture(fixture, *env);
+    if (!large) { return; }
+
+    auto const expected = large_lineitem_cache_effect_oracle(large->local_path);
+    auto const query    = large_lineitem_cache_effect_query(s3_large_lineitem_scan(*env));
+    auto first          = run_s5_cache_effect_query(fixture, large->uri, query);
+    CHECK(first.has_cache == expect_cache);
+    CHECK(first.value == Approx(expected).epsilon(1e-10).margin(1e-5));
+    CHECK(first.bytes_read > 0);
+    INFO("first_pass_bytes=" << first.bytes_read << " object_size=" << large->object_size);
+    CHECK(within_large_s3_byte_budget(first.bytes_read, large->object_size));
+
+    if (expect_cache && !second_pass) {
+      CHECK(total_cache_hits(first.cache) > 0);
+      INFO("range_miss=" << first.cache.range_miss << " hit_count=" << first.cache.hit_count
+                         << " hit_after_wait=" << first.cache.hit_after_wait);
+      CHECK(has_only_residual_range_misses(first.cache));
+    }
+    if (!expect_cache) { CHECK(first.fsmr_borrows > 0); }
+
+    if (second_pass) {
+      auto second = run_s5_cache_effect_query(fixture, large->uri, query);
+      CHECK(second.has_cache);
+      CHECK(second.value == Approx(expected).epsilon(1e-10).margin(1e-5));
+      CHECK(second.bytes_read > 0);
+      INFO("second_pass_bytes=" << second.bytes_read << " object_size=" << large->object_size);
+      CHECK(within_large_s3_byte_budget(second.bytes_read, large->object_size));
+      INFO("prewarm_off_second_pass_hits=" << total_cache_hits(second.cache)
+                                           << " range_miss=" << second.cache.range_miss);
+    }
+  };
+
+  SECTION("explicit cache off")
+  {
+    run_mode(large_sirius_memory_limits_cache_effect_off(), false, false);
+  }
+  SECTION("default cache on with chunk prewarm")
+  {
+    run_mode(large_sirius_memory_limits_cache_effect(), true, false);
+  }
+  SECTION("explicit cache on without chunk prewarm")
+  {
+    run_mode(large_sirius_memory_limits_cache_effect_without_chunk_prewarm(), true, true);
+  }
+}
+
 TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracle",
           "[.][s3][sql][large][large-count][gpu_execution][integration]")
 {
@@ -1489,13 +1747,11 @@ TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
-  auto& s3_ctx              = require_s3_ioctx(fixture, large->uri);
-  auto const before_bytes   = s3_ctx.bytes_read_total();
-  auto const before_borrows = s3_ctx.fsmr_borrows_total();
-  auto const s3_query       = tpch_q1_shape_query(s3_large_lineitem_scan(*env));
-  auto s3_result            = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
-  auto const byte_delta     = s3_ctx.bytes_read_total() - before_bytes;
-  auto const borrow_delta   = s3_ctx.fsmr_borrows_total() - before_borrows;
+  auto& s3_ctx            = require_s3_ioctx(fixture, large->uri);
+  auto const before_bytes = s3_ctx.bytes_read_total();
+  auto const s3_query     = tpch_q1_shape_query(s3_large_lineitem_scan(*env));
+  auto s3_result          = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
+  auto const byte_delta   = s3_ctx.bytes_read_total() - before_bytes;
 
   duckdb::DuckDB baseline_db(nullptr);
   duckdb::Connection baseline_con(baseline_db);
@@ -1508,7 +1764,6 @@ TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
   CHECK(byte_delta > 0);
   INFO("byte_delta=" << byte_delta << " object_size=" << large->object_size);
   CHECK(within_large_s3_byte_budget(byte_delta, large->object_size));
-  CHECK(borrow_delta > 0);
 }
 
 TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and matches local CPU",
@@ -1643,9 +1898,12 @@ TEST_CASE("B1 Phase 3a cache-mode bench records SF10 S3 SQL telemetry",
   };
 
   std::array<bench_config, 3> const configs{{
-    {kB1CacheOffConfig, large_sirius_memory_limits(), false, true},
-    {kB1CacheOnPrewarmOn, large_sirius_memory_limits_with_chunk_prewarm(true), true, false},
-    {kB1CacheOnPrewarmOff, large_sirius_memory_limits_with_chunk_prewarm(false), true, true},
+    {kB1CacheOffConfig, large_sirius_memory_limits_cache_effect_off(), false, true},
+    {kB1CacheOnPrewarmOn, large_sirius_memory_limits_cache_effect(), true, false},
+    {kB1CacheOnPrewarmOff,
+     large_sirius_memory_limits_cache_effect_without_chunk_prewarm(),
+     true,
+     true},
   }};
 
   std::vector<b1_run_record> records;

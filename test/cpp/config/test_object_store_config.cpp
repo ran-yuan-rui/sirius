@@ -209,3 +209,61 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("sirius_config leaves omitted enable_prefetch_cache in the unset state",
+          "[scan_manager][config][prefetching_cache][s3][config]")
+{
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_prefetch_cache_default_unset.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  executor:\n"
+           "    scan_manager:\n"
+           "      use_sirius_datasource: true\n";
+    REQUIRE(out);
+  }
+
+  sirius::sirius_config cfg;
+  cfg.load_from_file(path);
+
+  CHECK_FALSE(cfg.get_scan_manager_config().enable_prefetch_cache.has_value());
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config parses explicit enable_prefetch_cache bool states",
+          "[scan_manager][config][prefetching_cache][s3][config]")
+{
+  auto load_with_prefetch = [](bool enabled) {
+    auto const path =
+      std::filesystem::temp_directory_path() /
+      (enabled ? "sirius_prefetch_cache_true.yaml" : "sirius_prefetch_cache_false.yaml");
+    {
+      std::ofstream out(path);
+      out << "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      use_sirius_datasource: true\n"
+             "      enable_prefetch_cache: "
+          << (enabled ? "true\n" : "false\n");
+      REQUIRE(out);
+    }
+
+    sirius::sirius_config cfg;
+    cfg.load_from_file(path);
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return cfg;
+  };
+
+  auto true_cfg = load_with_prefetch(true);
+  REQUIRE(true_cfg.get_scan_manager_config().enable_prefetch_cache.has_value());
+  CHECK(*true_cfg.get_scan_manager_config().enable_prefetch_cache);
+
+  auto false_cfg = load_with_prefetch(false);
+  REQUIRE(false_cfg.get_scan_manager_config().enable_prefetch_cache.has_value());
+  CHECK_FALSE(*false_cfg.get_scan_manager_config().enable_prefetch_cache);
+}

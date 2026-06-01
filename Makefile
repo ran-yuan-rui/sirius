@@ -23,7 +23,8 @@ MAIN_BUILD_TARGETS ?= duckdb duckdb_local_extension_repo
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
 	s3-up s3-up-large s3-down s3-test s3-test-large \
-	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench s3-bench-fixtures
+	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-test-aws-cache \
+	s3-bench s3-bench-fixtures
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -144,6 +145,9 @@ list-presets: $(PRESETS_LINK)
 # `make s3-test-aws-broker`
 #                     subset driven by an external presign broker
 #                     ([s3][aws][broker]).
+# `make s3-test-aws-cache`
+#                     manual S3 cache-effect smoke over the large AWS fixture
+#                     ([s3][aws][live][cache]).
 #
 # See test/cpp/integration/s3/README.md for details.
 
@@ -193,7 +197,9 @@ s3-test-large:
 	$(S3_TEST_BIN) "[s3][sql][large][large-join]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-q1-no-prewarm]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-join-no-prewarm]"
+	$(S3_TEST_BIN) "[s3][sql][large][large-join-no-prewarm]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-prefetch-on]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-prefetch-off]"
 
 # Manual real-AWS gates. These never start MinIO/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
@@ -229,6 +235,16 @@ s3-test-aws-broker:
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
 	$(S3_TEST_BIN) "[s3][aws][broker]"
+
+s3-test-aws-cache: SHELL := /bin/bash
+s3-test-aws-cache:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-test-aws-cache: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	export SIRIUS_TEST_S3_STRICT=1; \
+	$(S3_TEST_BIN) "[s3][aws][live][cache]"
 
 # -----------------------------------------------------------------------------
 # S3 perf benchmark (Catch2 [!benchmark][perf][bench] hidden tag - not in the

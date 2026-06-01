@@ -282,6 +282,24 @@ sirius::sirius_config make_context_config(std::string_view filename = "integrati
   return cfg;
 }
 
+constexpr std::size_t kS5SmallPrefetchPoolBytes = 512ULL << 20;
+
+void configure_minimal_s3_object_store(sirius::sirius_config& cfg)
+{
+  cfg.object_store_config.endpoint   = "http://127.0.0.1:9000";
+  cfg.object_store_config.region     = "us-east-1";
+  cfg.object_store_config.access_key = "minioadmin";
+  cfg.object_store_config.secret_key = "minioadmin";
+}
+
+void set_small_prefetch_pool(sirius::sirius_config& cfg)
+{
+  auto scan_cfg                            = cfg.get_scan_manager_config();
+  scan_cfg.prefetch_buffer_pool_bytes      = kS5SmallPrefetchPoolBytes;
+  scan_cfg.prefetch_inflight_budget_chunks = 8;
+  cfg.set_scan_manager_config(std::move(scan_cfg));
+}
+
 }  // namespace
 
 TEST_CASE("sirius_scan_manager routes borrowed S3 backend and dispatches by path",
@@ -380,6 +398,106 @@ TEST_CASE("sirius_config carries object_store_config and defaults keep S3 disabl
   CHECK(cfg.object_store_config.endpoint.empty());
   CHECK(cfg.object_store_config.access_key.empty());
   CHECK_FALSE(cfg.get_scan_manager_config().s3_config.has_value());
+}
+
+TEST_CASE("SiriusContext defaults S3 prefetch cache on when S3 config is complete",
+          "[.][s3][integration][prefetch][scan_manager]")
+{
+  auto cfg = make_context_config("integration_s3cache.yaml");
+  configure_minimal_s3_object_store(cfg);
+  set_small_prefetch_pool(cfg);
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  auto s3_ctx = context.get_s3_ioctx();
+  REQUIRE(s3_ctx != nullptr);
+  CHECK(context.get_prefetch_buffer_pool() != nullptr);
+  CHECK(s3_ctx->cache() != nullptr);
+  CHECK(context.get_scan_manager().chunk_prewarm_enabled());
+
+  context.terminate();
+}
+
+TEST_CASE("SiriusContext honors explicit S3 prefetch cache opt-out",
+          "[.][s3][integration][prefetch][scan_manager]")
+{
+  auto cfg = make_context_config("integration_s3cache.yaml");
+  configure_minimal_s3_object_store(cfg);
+  auto scan_cfg                       = cfg.get_scan_manager_config();
+  scan_cfg.enable_prefetch_cache      = false;
+  scan_cfg.prefetch_buffer_pool_bytes = kS5SmallPrefetchPoolBytes;
+  cfg.set_scan_manager_config(std::move(scan_cfg));
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  auto s3_ctx = context.get_s3_ioctx();
+  REQUIRE(s3_ctx != nullptr);
+  CHECK(context.get_prefetch_buffer_pool() == nullptr);
+  CHECK(s3_ctx->cache() == nullptr);
+
+  context.terminate();
+}
+
+TEST_CASE("SiriusContext does not allocate default prefetch pool without S3",
+          "[.][s3][integration][prefetch][scan_manager]")
+{
+  auto cfg = make_context_config("integration_s3cache.yaml");
+  set_small_prefetch_pool(cfg);
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  CHECK(context.get_s3_ioctx() == nullptr);
+  CHECK(context.get_prefetch_buffer_pool() == nullptr);
+  for (auto const& [device_id, io_ctx] : context.get_gpu_ioctxs()) {
+    INFO("device_id=" << device_id);
+    REQUIRE(io_ctx != nullptr);
+    CHECK(io_ctx->cache() == nullptr);
+  }
+
+  context.terminate();
+}
+
+TEST_CASE("SiriusContext explicit prefetch cache true allocates without S3",
+          "[.][s3][integration][prefetch][scan_manager]")
+{
+  auto cfg                            = make_context_config("integration_s3cache.yaml");
+  auto scan_cfg                       = cfg.get_scan_manager_config();
+  scan_cfg.enable_prefetch_cache      = true;
+  scan_cfg.prefetch_buffer_pool_bytes = kS5SmallPrefetchPoolBytes;
+  cfg.set_scan_manager_config(std::move(scan_cfg));
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  CHECK(context.get_s3_ioctx() == nullptr);
+  CHECK(context.get_prefetch_buffer_pool() != nullptr);
+  for (auto const& [device_id, io_ctx] : context.get_gpu_ioctxs()) {
+    INFO("device_id=" << device_id);
+    REQUIRE(io_ctx != nullptr);
+    CHECK(io_ctx->cache() != nullptr);
+  }
+
+  context.terminate();
+}
+
+TEST_CASE("SiriusContext keeps incomplete S3 config cacheless by default",
+          "[.][s3][integration][prefetch][scan_manager]")
+{
+  auto cfg                         = make_context_config("integration_s3cache.yaml");
+  cfg.object_store_config.endpoint = "http://127.0.0.1:9000";
+  cfg.object_store_config.region   = "us-east-1";
+  set_small_prefetch_pool(cfg);
+
+  duckdb::SiriusContext context;
+  context.initialize(cfg);
+
+  CHECK(context.get_s3_ioctx() == nullptr);
+  CHECK(context.get_prefetch_buffer_pool() == nullptr);
+
+  context.terminate();
 }
 
 TEST_CASE("sirius_scan_manager wires S3 ioctx cache and serves repeated host reads from it",

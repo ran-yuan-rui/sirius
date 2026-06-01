@@ -79,11 +79,15 @@ struct scan_manager_config {
   /// io_uring submission/completion queue depth per reactor.  Ignored when
   /// @c use_sirius_datasource is false.
   unsigned uring_ring_entries{64};
-  /// Enable the prefetching cache.  Requires @c use_sirius_datasource=true;
-  /// when true, SiriusContext (S6) allocates a pinned-host buffer_pool and
-  /// initializes the cache on the IO backends it owns (the per-NUMA urings and
-  /// the s3_ioctx).  Off by default.
-  bool enable_prefetch_cache{false};
+  /// Three-state prefetch-cache switch. When enabled, SiriusContext (S6)
+  /// allocates a pinned-host buffer_pool and initializes the cache on the IO
+  /// backends it owns (the per-NUMA urings and the s3_ioctx).
+  ///   unset (nullopt) -> enabled iff an S3 backend is configured (S3 default-on);
+  ///                      local-only deployments stay off (no pinned pool forced).
+  ///   true            -> enabled explicitly (allocates the pool even local-only).
+  ///   false           -> disabled explicitly.
+  /// Resolved once in SiriusContext::initialize().
+  std::optional<bool> enable_prefetch_cache{};
   /// Total pinned-host bytes reserved for the prefetch cache.  Rounded
   /// up to the nearest 500 MiB slab.  Ignored when
   /// @c enable_prefetch_cache is false.

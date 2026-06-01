@@ -663,7 +663,14 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     s3_cfg.host_memory_resource = host_fsmr;
     s3_ioctx_                   = std::make_shared<sirius::io::s3::s3_ioctx>(std::move(s3_cfg));
   }
-  if (scan_cfg.enable_prefetch_cache && host_fsmr != nullptr) {
+  // S5: resolve the three-state prefetch default.
+  //   unset  -> enabled iff an S3 backend was configured (s3_ioctx_ != nullptr);
+  //   true   -> enabled (explicit; even local-only);
+  //   false  -> disabled (explicit opt-out).
+  const bool prefetch_on = scan_cfg.enable_prefetch_cache.has_value()
+                             ? *scan_cfg.enable_prefetch_cache
+                             : (s3_ioctx_ != nullptr);
+  if (prefetch_on && host_fsmr != nullptr) {
     auto const slab_bytes = host_fsmr->get_block_size() *
                             static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
     auto const max_slabs =
