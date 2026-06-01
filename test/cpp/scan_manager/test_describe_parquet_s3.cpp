@@ -241,6 +241,27 @@ class describe_parquet_context {
   bool initialized_{false};
 };
 
+void check_same_bind_result(sirius::scan_manager::parquet_bind_result const& lhs,
+                            sirius::scan_manager::parquet_bind_result const& rhs)
+{
+  CHECK(lhs.names == rhs.names);
+  REQUIRE(lhs.return_types.size() == rhs.return_types.size());
+  for (std::size_t i = 0; i < lhs.return_types.size(); ++i) {
+    CHECK(lhs.return_types[i].ToString() == rhs.return_types[i].ToString());
+  }
+  CHECK(lhs.object_size == rhs.object_size);
+  CHECK(lhs.total_num_rows == rhs.total_num_rows);
+}
+
+s3_ioctx* require_s3_ioctx(sirius_scan_manager& manager, std::string const& uri)
+{
+  auto* base_ctx = manager.io_ctx_for(uri);
+  REQUIRE(base_ctx != nullptr);
+  auto* s3_ctx = dynamic_cast<s3_ioctx*>(base_ctx);
+  REQUIRE(s3_ctx != nullptr);
+  return s3_ctx;
+}
+
 }  // namespace
 
 TEST_CASE("describe_parquet reports no matching backend with the URI in the error",
@@ -367,6 +388,93 @@ TEST_CASE("describe_parquet inserts parsed parquet metadata into the prefetch ca
   CHECK(parquet->footer_byte_len() > 0);
   CHECK_FALSE(bind_info.names.empty());
   CHECK(parquet->file_metadata()->schema.size() >= bind_info.names.size() + 1);
+}
+
+TEST_CASE("describe_parquet reuses cached S3 parquet metadata for repeat binds",
+          "[.][s3][integration][describe_parquet]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  describe_parquet_context fixture(*env, true);
+  auto& manager  = fixture.context.get_scan_manager();
+  auto const uri = s3_uri(env->bucket, "parquet/customer.parquet");
+  auto* s3_ctx   = require_s3_ioctx(manager, uri);
+  REQUIRE(s3_ctx->cache() != nullptr);
+
+  auto const cold_before = s3_ctx->bytes_read_total();
+  auto cold              = manager.describe_parquet(uri);
+  auto const cold_delta  = s3_ctx->bytes_read_total() - cold_before;
+
+  CHECK(cold_delta > 0);
+  CHECK_FALSE(cold.names.empty());
+  CHECK(cold.return_types.size() == cold.names.size());
+  CHECK(cold.object_size > 0);
+  CHECK(cold.total_num_rows > 0);
+
+  auto const warm_before = s3_ctx->bytes_read_total();
+  auto warm              = manager.describe_parquet(uri);
+  auto const warm_delta  = s3_ctx->bytes_read_total() - warm_before;
+
+  CHECK(warm_delta == 0);
+  check_same_bind_result(cold, warm);
+}
+
+TEST_CASE("describe_parquet without S3 cache fetches and parses each bind",
+          "[.][s3][integration][describe_parquet]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  describe_parquet_context fixture(*env, false);
+  auto& manager  = fixture.context.get_scan_manager();
+  auto const uri = s3_uri(env->bucket, "parquet/customer.parquet");
+  auto* s3_ctx   = require_s3_ioctx(manager, uri);
+  REQUIRE(s3_ctx->cache() == nullptr);
+
+  auto const first_before = s3_ctx->bytes_read_total();
+  auto first              = manager.describe_parquet(uri);
+  auto const first_delta  = s3_ctx->bytes_read_total() - first_before;
+
+  auto const second_before = s3_ctx->bytes_read_total();
+  auto second              = manager.describe_parquet(uri);
+  auto const second_delta  = s3_ctx->bytes_read_total() - second_before;
+
+  CHECK(first_delta > 0);
+  CHECK(second_delta > 0);
+  CHECK_FALSE(first.names.empty());
+  CHECK(first.return_types.size() == first.names.size());
+  check_same_bind_result(first, second);
+}
+
+TEST_CASE("describe_parquet metadata cache does not cross-hit distinct S3 objects",
+          "[.][s3][integration][describe_parquet]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  describe_parquet_context fixture(*env, true);
+  auto& manager      = fixture.context.get_scan_manager();
+  auto const uri_a   = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const uri_b   = s3_uri(env->bucket, "parquet/orders.parquet");
+  auto* s3_ctx       = require_s3_ioctx(manager, uri_a);
+  auto* s3_ctx_for_b = require_s3_ioctx(manager, uri_b);
+  REQUIRE(s3_ctx == s3_ctx_for_b);
+  REQUIRE(s3_ctx->cache() != nullptr);
+
+  auto first = manager.describe_parquet(uri_a);
+
+  auto const second_before = s3_ctx->bytes_read_total();
+  auto second              = manager.describe_parquet(uri_b);
+  auto const second_delta  = s3_ctx->bytes_read_total() - second_before;
+
+  CHECK(second_delta > 0);
+  CHECK_FALSE(second.names.empty());
+  CHECK(second.return_types.size() == second.names.size());
+  CHECK(second.object_size > 0);
+  CHECK(second.total_num_rows > 0);
+  CHECK(second.names != first.names);
+  CHECK(second.object_size != first.object_size);
 }
 
 TEST_CASE("describe_parquet exposes the parquet footer row count for planner metadata",

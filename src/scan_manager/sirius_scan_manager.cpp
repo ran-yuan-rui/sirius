@@ -149,6 +149,25 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   auto io_object  = io_ctx->create_io_object(uri);
   auto datasource = io_ctx->make_datasource(io_object);
 
+  // Reuse a previously-parsed footer when the metadata cache already holds it
+  // (repeat binds of the same URI: self-join / UNION / multi-query). Mirrors the
+  // scan path's get_metadata reuse in parquet_split_provider::run_batch, so the
+  // footer GET + Thrift parse happen once per object instead of once per bind.
+  if (auto* cache = io_ctx->cache(); cache != nullptr) {
+    if (auto cached = cache->get_metadata(*io_object)) {
+      if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
+        auto const& cached_file_metadata = *pm->file_metadata();
+        auto schema = sirius::io::parquet_helpers::extract_schema(cached_file_metadata);
+        parquet_bind_result result;
+        result.return_types   = std::move(schema.types);
+        result.names          = std::move(schema.names);
+        result.object_size    = datasource->size();
+        result.total_num_rows = static_cast<std::size_t>(cached_file_metadata.num_rows);
+        return result;
+      }
+    }
+  }
+
   auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
   auto const footer_byte_len = footer_buffer->size();
   auto reader_options        = cudf::io::parquet_reader_options::builder().build();
