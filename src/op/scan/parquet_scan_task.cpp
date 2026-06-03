@@ -108,6 +108,35 @@ std::unique_ptr<cudf::io::datasource::buffer> fetch_footer_to_host_fallback(
 
 namespace detail {
 
+// Index one past the preorder schema subtree rooted at `idx`. A flat leaf occupies
+// one element; a nested column (STRUCT / LIST / MAP) spans its whole subtree.
+static std::size_t subtree_end(cudf::io::parquet::FileMetaData const& meta, std::size_t idx)
+{
+  if (idx >= meta.schema.size()) { return idx; }
+  std::size_t next = idx + 1;
+  for (int c = 0; c < meta.schema[idx].num_children && next < meta.schema.size(); ++c) {
+    next = subtree_end(meta, next);
+  }
+  return next;
+}
+
+// Names of the top-level columns (the root group's direct children), keyed by their
+// top-level name — so a nested column contributes its top-level name (e.g. "payload"
+// for a STRUCT column), not its leaf field names. Used to match against DuckDB's
+// top-level scan column names.
+static std::unordered_set<std::string> top_level_column_names(
+  cudf::io::parquet::FileMetaData const& meta)
+{
+  std::unordered_set<std::string> names;
+  if (meta.schema.empty()) { return names; }
+  std::size_t idx = 1;
+  for (int c = 0; c < meta.schema[0].num_children && idx < meta.schema.size(); ++c) {
+    names.insert(meta.schema[idx].name);
+    idx = subtree_end(meta, idx);
+  }
+  return names;
+}
+
 bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
                                 std::vector<std::string> const& projected_column_names)
 {
@@ -115,21 +144,24 @@ bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
   if (meta.row_groups.empty()) { return true; }
   auto const& cols = meta.row_groups.front().columns;
 
-  // Build name → column index map for the parquet file.
-  std::unordered_map<std::string, size_t> name_to_idx;
-  for (size_t i = 0; i < cols.size(); ++i) {
-    if (!cols[i].meta_data.path_in_schema.empty()) {
-      name_to_idx[cols[i].meta_data.path_in_schema[0]] = i;
+  // Set of top-level parquet column names. A nested column contributes several
+  // leaf chunks that all share the same `path_in_schema[0]` (the top-level name),
+  // so this set captures both flat and nested top-level columns.
+  std::unordered_set<std::string> top_level_names;
+  for (auto const& col : cols) {
+    if (!col.meta_data.path_in_schema.empty()) {
+      top_level_names.insert(col.meta_data.path_in_schema[0]);
     }
   }
 
-  // Flat leaf column => path length == 1.
+  // A projected column is accepted iff it names a top-level column present in the
+  // file. v1 reads a projected nested top-level column whole (STRUCT / LIST / MAP);
+  // projection *into* a nested sub-field is not pushed down, so it never appears
+  // here as a separate name.
   return std::all_of(projected_column_names.begin(),
                      projected_column_names.end(),
-                     [&cols, &name_to_idx](auto const& col_name) {
-                       auto it = name_to_idx.find(col_name);
-                       return it != name_to_idx.end() &&
-                              cols[it->second].meta_data.path_in_schema.size() == 1;
+                     [&top_level_names](auto const& col_name) {
+                       return top_level_names.find(col_name) != top_level_names.end();
                      });
 }
 
@@ -404,13 +436,13 @@ void parquet_scan_task_global_state::initialize_from_files()
   // recorded in _hive_partition_columns for injection after GPU read.
   // -----------------------------------------------------------------------
   if (!_file_metadatas.empty() && !_selected_column_indices.empty() && !_scan_op->names.empty()) {
+    // Use TOP-LEVEL column names (not parquet leaf names), so a nested top-level
+    // column (e.g. STRUCT "payload" with leaves "a"/"b") matches DuckDB's top-level
+    // scan name and is not misread as a missing/hive-partition column.
     std::unordered_set<std::string> union_parquet_col_names;
     for (auto const& meta : _file_metadatas) {
-      for (size_t i = 1; i < meta.schema.size(); ++i) {
-        if (meta.schema[i].num_children == 0) {
-          union_parquet_col_names.insert(meta.schema[i].name);
-        }
-      }
+      auto const file_names = detail::top_level_column_names(meta);
+      union_parquet_col_names.insert(file_names.begin(), file_names.end());
     }
 
     std::vector<size_t> filtered_indices;
@@ -439,19 +471,28 @@ void parquet_scan_task_global_state::initialize_from_files()
   // from SOME but not ALL files). If detected, populate _per_file_column_names
   // for the schema reconciliation injection function.
   if (_file_metadatas.size() > 1 && !_selected_column_indices.empty() && !_scan_op->names.empty()) {
+    // Per-file TOP-LEVEL column names (nested columns by their top-level name).
     std::vector<std::unordered_set<std::string>> per_file_cols(_file_metadatas.size());
     for (size_t f = 0; f < _file_metadatas.size(); ++f) {
-      for (size_t i = 1; i < _file_metadatas[f].schema.size(); ++i) {
-        if (_file_metadatas[f].schema[i].num_children == 0) {
-          per_file_cols[f].insert(_file_metadatas[f].schema[i].name);
-        }
-      }
+      per_file_cols[f] = detail::top_level_column_names(_file_metadatas[f]);
     }
 
     bool has_schema_evolution = false;
     for (size_t f = 0; f < per_file_cols.size() && !has_schema_evolution; ++f) {
       for (auto idx : _selected_column_indices) {
         if (idx < _scan_op->names.size() && !per_file_cols[f].count(_scan_op->names[idx])) {
+          // Phase-1 boundary: a nested (STRUCT/LIST/MAP) column missing from some
+          // files cannot be null-injected — sirius carries no flat type to synthesize
+          // a typed null nested column. Reject clearly instead of silently dropping it
+          // or crashing later in scalar construction.
+          if (idx < _scan_op->returned_types.size() &&
+              (_scan_op->returned_types[idx].id() == sirius::type_id::STRUCT ||
+               _scan_op->returned_types[idx].id() == sirius::type_id::LIST)) {
+            throw std::runtime_error(
+              "[parquet_scan] nested column '" + _scan_op->names[idx] +
+              "' is absent from some files under schema evolution; reading a nested "
+              "(STRUCT/LIST/MAP) column that is not present in all files is not supported");
+          }
           has_schema_evolution = true;
           break;
         }
@@ -615,19 +656,25 @@ void parquet_scan_task_global_state::initialize_from_files()
     std::unordered_set<size_t> pure_filter_parquet_indices;
     if (!file_metadata.row_groups.empty()) {
       auto const& cols = file_metadata.row_groups.front().columns;
-      std::unordered_map<std::string, size_t> name_to_pq_idx;
+      // A nested top-level column spans several parquet leaf chunks that share the
+      // same path_in_schema[0]; map the top-level name to ALL of them so the byte
+      // reservation covers the whole subtree cuDF will read (otherwise the
+      // bytes_read != reserved_compressed_bytes check trips / under-allocates).
+      std::unordered_map<std::string, std::vector<size_t>> name_to_pq_idxs;
       for (size_t i = 0; i < cols.size(); ++i) {
         if (!cols[i].meta_data.path_in_schema.empty()) {
-          name_to_pq_idx[cols[i].meta_data.path_in_schema[0]] = i;
+          name_to_pq_idxs[cols[i].meta_data.path_in_schema[0]].push_back(i);
         }
       }
       for (auto duckdb_idx : _selected_column_indices) {
         if (duckdb_idx < _scan_op->names.size()) {
-          auto it = name_to_pq_idx.find(_scan_op->names[duckdb_idx]);
-          if (it != name_to_pq_idx.end()) {
-            parquet_col_indices.push_back(it->second);
-            if (pure_filter_column_indices.count(duckdb_idx)) {
-              pure_filter_parquet_indices.insert(it->second);
+          auto it = name_to_pq_idxs.find(_scan_op->names[duckdb_idx]);
+          if (it != name_to_pq_idxs.end()) {
+            for (auto const pq_idx : it->second) {
+              parquet_col_indices.push_back(pq_idx);
+              if (pure_filter_column_indices.count(duckdb_idx)) {
+                pure_filter_parquet_indices.insert(pq_idx);
+              }
             }
           }
         }
@@ -747,7 +794,16 @@ void parquet_scan_task_global_state::build_schema_reconciliation(
         }
       }
       if (is_selected || is_partition) {
-        auto duckdb_type = sirius::to_duckdb(scan_op->returned_types[idx]);
+        auto const& sirius_type = scan_op->returned_types[idx];
+        // A nested (STRUCT/LIST/MAP) column has no faithful flat DuckDB type, and
+        // sirius::to_duckdb deliberately throws for LIST. Its `col.type` is only
+        // consulted for columns ABSENT from the parquet file (hive-partition /
+        // schema-evolution injection in the partition-inject lambda), which a
+        // selected nested column never is — so a placeholder is safe here.
+        auto duckdb_type =
+          (sirius_type.id() == sirius::type_id::STRUCT || sirius_type.id() == sirius::type_id::LIST)
+            ? duckdb::LogicalType(duckdb::LogicalTypeId::SQLNULL)
+            : sirius::to_duckdb(sirius_type);
         output_cols.push_back({scan_op->names[idx], duckdb_type, is_partition});
       }
     }
@@ -779,6 +835,16 @@ void parquet_scan_task_global_state::build_schema_reconciliation(
       if (in_parquet) {
         out.push_back(std::make_unique<cudf::column>(tbl->get_column(data_col++), stream));
       } else {
+        // A SQLNULL placeholder type here means a nested (STRUCT/LIST/MAP) column is
+        // absent from this file under schema evolution. We carry no nested type info to
+        // synthesize a typed null nested column, so reject clearly instead of crashing
+        // inside DuckDBValueToCudfScalar.
+        if (col.type.id() == duckdb::LogicalTypeId::SQLNULL) {
+          throw std::runtime_error(
+            "[parquet_scan] nested column '" + col.name +
+            "' is absent from some files under schema evolution; null-injecting a nested "
+            "(STRUCT/LIST/MAP) column is not supported");
+        }
         auto pit = partitions.find(col.name);
         if (pit != partitions.end()) {
           auto val    = duckdb::Value(pit->second).DefaultCastAs(col.type);
