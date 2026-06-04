@@ -169,19 +169,60 @@ upload_standard_fixtures "local" "${MC_ENDPOINT}" "0"
 upload_standard_fixtures "localtls" "${MC_TLS_ENDPOINT}" "1"
 
 if [[ "${PERF_MODE}" -eq 1 ]]; then
-  resolve_duckdb
-  export SIRIUS_CONFIG_FILE="${SIRIUS_CONFIG_FILE:-${SCRIPT_DIR}/sirius.yaml}"
+  PERF_SIDECAR="${PERF_PARQUET}.sha256"
 
-  echo "[fixtures] generating SF10 lineitem benchmark parquet with ${DUCKDB_BIN}"
-  rm -f "${PERF_DB}" "${PERF_PARQUET}"
-  "${DUCKDB_BIN}" "${PERF_DB}" <<SQL
+  # Reuse a previously generated perf fixture instead of regenerating it.
+  # Regeneration needs the tpch extension loadable by the duckdb CLI, which is
+  # not available on every build/host (e.g. a fresh worktree whose CLI lacks
+  # tpch); reusing a cached fixture keeps s3-test-large runnable without tpch.
+  # Regenerate only when the fixture is missing, fails checksum validation, or a
+  # regen is explicitly forced via SIRIUS_BENCH_FORCE_REGEN=1.
+  reuse_fixture=0
+  if [[ "${SIRIUS_BENCH_FORCE_REGEN:-0}" == "1" ]]; then
+    echo "[fixtures] SIRIUS_BENCH_FORCE_REGEN=1: regenerating perf fixture"
+  elif [[ ! -s "${PERF_PARQUET}" ]]; then
+    echo "[fixtures] no cached perf fixture at ${PERF_PARQUET}; generating"
+  elif [[ -f "${PERF_SIDECAR}" ]]; then
+    if (cd "${WORK_DIR}" && sha256sum -c "$(basename "${PERF_SIDECAR}")" >/dev/null 2>&1); then
+      reuse_fixture=1
+    else
+      echo "[fixtures] cached perf fixture ${PERF_PARQUET} is invalid (checksum mismatch); regenerating"
+    fi
+  elif [[ "$(head -c 4 "${PERF_PARQUET}" 2>/dev/null)" == "PAR1" &&
+          "$(tail -c 4 "${PERF_PARQUET}" 2>/dev/null)" == "PAR1" ]]; then
+    # No sidecar (older cache): accept a non-empty parquet carrying the parquet
+    # magic and backfill the sidecar so future runs validate by checksum.
+    reuse_fixture=1
+  else
+    echo "[fixtures] cached perf fixture ${PERF_PARQUET} is invalid (missing parquet magic); regenerating"
+  fi
+
+  if [[ "${reuse_fixture}" -eq 1 ]]; then
+    echo "[fixtures] reusing existing perf fixture ${PERF_PARQUET}"
+    if [[ ! -f "${PERF_SIDECAR}" ]]; then
+      (cd "${WORK_DIR}" && sha256sum "$(basename "${PERF_PARQUET}")" > "$(basename "${PERF_SIDECAR}")")
+    fi
+  else
+    resolve_duckdb
+    export SIRIUS_CONFIG_FILE="${SIRIUS_CONFIG_FILE:-${SCRIPT_DIR}/sirius.yaml}"
+
+    echo "[fixtures] generating SF10 lineitem benchmark parquet with ${DUCKDB_BIN}"
+    rm -f "${PERF_DB}" "${PERF_PARQUET}" "${PERF_SIDECAR}"
+    "${DUCKDB_BIN}" "${PERF_DB}" <<SQL
 LOAD tpch;
 CALL dbgen(sf=10);
 COPY (
   SELECT * FROM lineitem
 ) TO '${PERF_PARQUET}' (FORMAT PARQUET);
 SQL
-  rm -f "${PERF_DB}"
+    rm -f "${PERF_DB}"
+
+    if [[ ! -s "${PERF_PARQUET}" ]]; then
+      echo "[fixtures] perf fixture generation produced no output: ${PERF_PARQUET}" >&2
+      exit 1
+    fi
+    (cd "${WORK_DIR}" && sha256sum "$(basename "${PERF_PARQUET}")" > "$(basename "${PERF_SIDECAR}")")
+  fi
 
   echo "[fixtures] uploading perf fixture to s3://${BUCKET}/${KEY}"
   mc_run "local" "${MC_ENDPOINT}" "0" "cp /work/$(basename "${PERF_PARQUET}") local/${BUCKET}/${KEY}"
