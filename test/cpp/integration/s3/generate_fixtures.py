@@ -16,6 +16,7 @@ known TPCH data as the regular GPU integration suite.
   small.bin        -- 20 KiB deterministic binary blob; bit-equal read via factory
   medium.bin       -- 8 MiB deterministic binary blob; multi-range reads
   parquet/*.parquet -- standard TPCH Parquet fixtures used by semantic tests
+  list/*           -- tiny LIST-only objects for s3_ioctx::list_objects tests
 
 The binary blobs are opaque bytes (NOT real parquet) -- the byte-equality
 tests in test_s3_integration.cpp only need deterministic, size-known objects.
@@ -75,6 +76,24 @@ def copy_parquet_fixtures(source_dir: Path, out_dir: Path) -> list[Path]:
     return paths
 
 
+def write_list_fixture_objects(out_dir: Path) -> list[Path]:
+    keys = [
+        "list/pfx/a.parquet",
+        "list/pfx/b.parquet",
+        "list/pfx/c.parquet",
+        "list/t/date=2026-06-01/part-0.parquet",
+        "list/t/date=2026-06-02/part-0.parquet",
+    ]
+
+    paths: list[Path] = []
+    for key in keys:
+        path = out_dir / key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"sirius-list-fixture:{key}\n".encode("utf-8"))
+        paths.append(path)
+    return paths
+
+
 def sha256_of(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -117,6 +136,9 @@ def main() -> int:
         stale_path = out_dir / stale
         if stale_path.exists():
             stale_path.unlink()
+    list_dir = out_dir / "list"
+    if list_dir.exists():
+        shutil.rmtree(list_dir)
 
     paths = [
         write_hello(out_dir),
@@ -124,6 +146,7 @@ def main() -> int:
         write_deterministic_bytes(out_dir / "medium.bin", MEDIUM_SIZE, MEDIUM_SEED),
     ]
     paths.extend(copy_parquet_fixtures(args.parquet_source, out_dir))
+    paths.extend(write_list_fixture_objects(out_dir))
 
     manifest_path = args.manifest or (out_dir / "MANIFEST.sha256")
     with manifest_path.open("w") as f:

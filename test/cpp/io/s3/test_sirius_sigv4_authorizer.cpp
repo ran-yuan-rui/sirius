@@ -107,6 +107,16 @@ bool is_lower_hex_64(std::string_view value)
          });
 }
 
+class object_only_authorizer final : public sirius::io::s3::s3_request_authorizer {
+ public:
+  s3_authorized_request authorize(s3_object_ref const&,
+                                  s3_request_method,
+                                  std::chrono::seconds) override
+  {
+    return {"https://signed.example/object", {}};
+  }
+};
+
 }  // namespace
 
 TEST_CASE("sirius_sigv4_presigned_authorizer normalizes HTTPS endpoint", "[s3][authorizer]")
@@ -432,4 +442,48 @@ TEST_CASE("mock_request_authorizer can force credential errors", "[s3][authorize
   auto request = provider.authorize({"bucket", "key"}, s3_request_method::GET, k_presign_timeout);
   CHECK(request.url == "https://signed.example/object");
   CHECK(request.headers.empty());
+}
+
+TEST_CASE("sirius_sigv4_presigned_authorizer signs ListObjectsV2 as a bucket query",
+          "[s3][authorizer]")
+{
+  sirius_sigv4_presigned_authorizer provider(
+    example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
+
+  auto request = provider.authorize_list(
+    "bucket", "list-type=2&max-keys=1000&prefix=p%2F", std::chrono::seconds{42});
+
+  CHECK(request.headers.empty());
+  CHECK(starts_with(request.url, "https://s3.us-east-1.amazonaws.com/bucket?"));
+  CHECK(contains(request.url, "list-type=2"));
+  CHECK(contains(request.url, "prefix=p%2F"));
+  CHECK(contains(request.url, "max-keys=1000"));
+  CHECK(query_value(request.url, "X-Amz-Expires") == "42");
+  CHECK_FALSE(query_value(request.url, "X-Amz-Credential").empty());
+  CHECK(is_lower_hex_64(query_value(request.url, "X-Amz-Signature")));
+}
+
+TEST_CASE("sirius_sigv4_header_authorizer signs ListObjectsV2 with headers", "[s3][authorizer]")
+{
+  sirius_sigv4_header_authorizer provider(
+    example_static_credentials(), "us-east-1", "http://minio.local:9000");
+
+  auto request = provider.authorize_list(
+    "bucket", "list-type=2&max-keys=1000&prefix=p%2F", std::chrono::seconds{42});
+
+  CHECK(request.url == "http://minio.local:9000/bucket?list-type=2&max-keys=1000&prefix=p%2F");
+  CHECK_FALSE(contains(request.url, "X-Amz-Signature"));
+  CHECK(starts_with(header_value(request.headers, "Authorization"), "AWS4-HMAC-SHA256 "));
+  CHECK_FALSE(header_value(request.headers, "x-amz-date").empty());
+  CHECK_FALSE(header_value(request.headers, "x-amz-content-sha256").empty());
+}
+
+TEST_CASE("s3_request_authorizer default LIST hook reports unsupported credentials",
+          "[s3][authorizer]")
+{
+  object_only_authorizer provider;
+
+  CHECK_THROWS_AS(
+    provider.authorize_list("bucket", "list-type=2&prefix=p%2F", std::chrono::seconds{42}),
+    credential_error);
 }

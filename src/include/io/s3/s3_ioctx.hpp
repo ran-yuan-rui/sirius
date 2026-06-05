@@ -25,8 +25,16 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace sirius::io::s3 {
+
+/// Default ceiling on the total number of keys a single @c list_objects call may
+/// accumulate across pages. A guard against an accidentally-broad prefix (e.g.
+/// a whole-bucket listing) exhausting memory; exceeding it throws rather than
+/// truncating (see @c list_objects). Exposed so callers / tests can reference it.
+inline constexpr std::size_t default_max_list_objects = 100'000;
 
 /**
  * @brief Production async-S3 backend (libcurl-multi reactor).
@@ -80,6 +88,22 @@ class s3_ioctx : public templated_ioctx<s3_reactor> {
   [[nodiscard]] std::uint64_t device_stream_sync_total() const noexcept;
   [[nodiscard]] std::uint64_t device_peak_inflight() const noexcept;
   std::size_t head_object_size(std::string_view bucket, std::string_view key);
+
+  /// List object keys under @p prefix in @p bucket via ListObjectsV2, following
+  /// pagination until the result is no longer truncated. Returns full object
+  /// keys (prefix included) in document order across pages; an empty vector when
+  /// nothing matches. @p page_size sets the per-request @c max-keys (clamped to
+  /// [1, 1000]) — exposed so callers/tests can force multi-page pagination.
+  ///
+  /// Memory guard: @p max_keys caps the total keys materialized. When the
+  /// running total would exceed it, @c list_objects throws @c std::runtime_error
+  /// — it does NOT silently truncate, because a partial key set would feed
+  /// bind/schema-merge a wrong, partial table. Narrow the prefix or raise
+  /// @p max_keys.
+  std::vector<std::string> list_objects(std::string_view bucket,
+                                        std::string_view prefix,
+                                        unsigned page_size   = 1000,
+                                        std::size_t max_keys = default_max_list_objects);
 
  private:
   [[nodiscard]] s3_reactor& reactor() noexcept { return *_reactors.front(); }

@@ -166,6 +166,13 @@ class s3_reactor {
 
   std::size_t head_object_size(std::string_view bucket, std::string_view key);
 
+  /// Blocking bucket-level ListObjectsV2 GET. @p canonical_query is the
+  /// already-encoded request query (no auth params); the authorizer's
+  /// @c authorize_list adds auth. Returns the raw XML response body on HTTP 200;
+  /// throws after exhausting the retry budget. Used by @c s3_ioctx::list_objects
+  /// (a control-plane op issued once per bind, so the blocking path is fine).
+  std::string blocking_list_request(std::string_view bucket, std::string_view canonical_query);
+
   [[nodiscard]] std::uint64_t bytes_read_total() const noexcept
   {
     return _bytes_read_total.load(std::memory_order_relaxed);

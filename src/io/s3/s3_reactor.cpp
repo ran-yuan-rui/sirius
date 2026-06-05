@@ -73,6 +73,16 @@ std::size_t curl_write_buf(void* ptr, std::size_t size, std::size_t nmemb, void*
 
 std::size_t curl_discard(void*, std::size_t size, std::size_t nmemb, void*) { return size * nmemb; }
 
+// Write callback appending the whole response body into a growable std::string
+// (the LIST response length is unknown up front, unlike a ranged object read).
+std::size_t curl_write_string(void* ptr, std::size_t size, std::size_t nmemb, void* userdata)
+{
+  auto* out         = static_cast<std::string*>(userdata);
+  std::size_t bytes = size * nmemb;
+  out->append(static_cast<char const*>(ptr), bytes);
+  return bytes;
+}
+
 // Header callback capturing Content-Range (206 validation) and Retry-After
 // (backoff override on 429 / 503).
 struct header_capture {
@@ -404,6 +414,71 @@ std::size_t s3_reactor::head_object_size(std::string_view bucket, std::string_vi
   std::size_t sz = 0;
   blocking_request(bucket, key, s3_request_method::HEAD, 0, 0, nullptr, &sz);
   return sz;
+}
+
+std::string s3_reactor::blocking_list_request(std::string_view bucket,
+                                              std::string_view canonical_query)
+{
+  ensure_curl_inited();
+  auto const max_attempts = std::max<std::size_t>(_cfg.max_retry_attempts, 1);
+  std::string last_why    = "no attempt made";
+
+  for (std::size_t attempt = 1; attempt <= max_attempts; ++attempt) {
+    // Authorize first (no curl handle to leak if signing throws).
+    s3_authorized_request req = _cfg.creds->authorize_list(
+      std::string{bucket},
+      std::string{canonical_query},
+      std::chrono::seconds{_cfg.request_timeout_s > 0 ? _cfg.request_timeout_s : 20});
+
+    CURL* h = curl_easy_init();
+    if (h == nullptr) throw std::runtime_error("s3_reactor: curl_easy_init failed");
+
+    curl_slist* hdrs = build_header_slist(req.headers);
+    std::string body;
+    header_capture hc;
+
+    curl_easy_setopt(h, CURLOPT_URL, req.url.c_str());
+    curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, curl_write_string);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, curl_header_capture);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, &hc);
+    if (_cfg.request_timeout_s > 0) curl_easy_setopt(h, CURLOPT_TIMEOUT, _cfg.request_timeout_s);
+    if (!_cfg.ca_bundle_path.empty())
+      curl_easy_setopt(h, CURLOPT_CAINFO, _cfg.ca_bundle_path.c_str());
+    if (!_cfg.tls_verify) {
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+      curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
+    CURLcode rc = curl_easy_perform(h);
+    long http   = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &http);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(h);
+
+    bool retriable = false;
+    if (rc != CURLE_OK) {
+      last_why  = std::string{"libcurl "} + curl_easy_strerror(rc);
+      retriable = is_retriable_curl_code(rc);
+    } else if (http == 200) {
+      return body;
+    } else {
+      last_why  = "HTTP " + std::to_string(http);
+      retriable = is_retriable_status(http);
+    }
+
+    if (!retriable || attempt >= max_attempts) break;
+    std::optional<std::chrono::milliseconds> ra;
+    if (_cfg.honor_retry_after) ra = parse_retry_after_seconds(hc.retry_after);
+    std::this_thread::sleep_for(backoff_delay(attempt, ra));
+  }
+
+  std::ostringstream os;
+  os << "s3_reactor: LIST " << bucket << "?" << canonical_query << " failed after " << max_attempts
+     << " attempt(s); last: " << last_why;
+  throw std::runtime_error(os.str());
 }
 
 // ---------------------------------------------------------------------------

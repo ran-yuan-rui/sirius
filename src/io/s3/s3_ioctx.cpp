@@ -16,11 +16,15 @@
 
 #include "io/s3/s3_ioctx.hpp"
 
+#include "io/s3/s3_list_parser.hpp"
+#include "io/s3/sigv4.hpp"
 #include "io/uri_parser.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -183,6 +187,62 @@ std::uint64_t s3_ioctx::device_peak_inflight() const noexcept
 std::size_t s3_ioctx::head_object_size(std::string_view bucket, std::string_view key)
 {
   return reactor().head_object_size(bucket, key);
+}
+
+std::vector<std::string> s3_ioctx::list_objects(std::string_view bucket,
+                                                std::string_view prefix,
+                                                unsigned page_size,
+                                                std::size_t max_keys)
+{
+  // ListObjectsV2 caps max-keys at 1000; clamp (0 -> default) so a caller can't
+  // ask for an out-of-range page.
+  unsigned const per_page = (page_size == 0 || page_size > 1000) ? 1000U : page_size;
+
+  std::vector<std::string> keys;
+  std::string token;
+  do {
+    // Canonical query with components in sorted (alphabetical) key order, as
+    // SigV4 requires: continuation-token < list-type < max-keys < prefix.
+    std::string query;
+    if (!token.empty()) {
+      query += "continuation-token=";
+      query += uri_encode(token, /*encode_slash=*/true);
+      query += '&';
+    }
+    query += "list-type=2&max-keys=";
+    query += std::to_string(per_page);
+    query += "&prefix=";
+    query += uri_encode(prefix, /*encode_slash=*/true);
+
+    auto const body = reactor().blocking_list_request(bucket, query);
+    auto page       = parse_list_objects_v2(body);
+    keys.insert(keys.end(),
+                std::make_move_iterator(page.keys.begin()),
+                std::make_move_iterator(page.keys.end()));
+    token = page.is_truncated ? std::move(page.next_continuation_token) : std::string{};
+
+    // A truncated page must carry a continuation token. A non-compliant response
+    // (IsTruncated=true with no NextContinuationToken) would otherwise exit the
+    // loop here and silently return only the pages seen so far — a partial key
+    // set. Refuse it rather than under-report the listing.
+    if (page.is_truncated && token.empty()) {
+      throw std::runtime_error(
+        "s3_ioctx::list_objects: truncated listing with no continuation token for prefix '" +
+        std::string{prefix} + "' in bucket '" + std::string{bucket} +
+        "'; refusing to return a partial result");
+    }
+
+    // Memory guard: throw rather than truncate. A silently-truncated key set
+    // would later resolve a glob to a partial table (a wrong result), so this
+    // must be a hard error the caller surfaces, not a logged warning.
+    if (keys.size() > max_keys) {
+      throw std::runtime_error("s3_ioctx::list_objects: S3 LIST matched more than " +
+                               std::to_string(max_keys) + " objects under prefix '" +
+                               std::string{prefix} + "'; narrow the prefix or raise max_keys");
+    }
+  } while (!token.empty());
+
+  return keys;
 }
 
 }  // namespace sirius::io::s3

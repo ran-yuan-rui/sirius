@@ -76,6 +76,13 @@ class sirius_sigv4_presigned_authorizer final : public sirius_sigv4_authorizer_b
                                   s3_request_method method,
                                   std::chrono::seconds timeout) override;
 
+  /// Presigned bucket-level ListObjectsV2: the request params are merged into
+  /// the signed query, so the returned URL carries both the list params and the
+  /// X-Amz-* auth params; headers are empty.
+  s3_authorized_request authorize_list(std::string const& bucket,
+                                       std::string const& canonical_query,
+                                       std::chrono::seconds timeout) override;
+
  private:
   std::chrono::seconds _ttl;
 };
@@ -105,6 +112,14 @@ class sirius_sigv4_header_authorizer final : public sirius_sigv4_authorizer_base
   s3_authorized_request authorize(s3_object_ref const& obj,
                                   s3_request_method method,
                                   std::chrono::seconds timeout) override;
+
+  /// Header-signed bucket-level ListObjectsV2: returns a plain
+  /// @c "{scheme}://{host}/{bucket}?{canonical_query}" URL plus the signed
+  /// Authorization / x-amz-* headers. @c timeout is unused (header auth carries
+  /// no explicit expiry).
+  s3_authorized_request authorize_list(std::string const& bucket,
+                                       std::string const& canonical_query,
+                                       std::chrono::seconds timeout) override;
 };
 
 }  // namespace sirius::io::s3

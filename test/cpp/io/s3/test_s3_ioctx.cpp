@@ -800,6 +800,64 @@ TEST_CASE("async-curl S3 host_read_ranges_async fans out and fills every range",
   }
 }
 
+TEST_CASE("s3_ioctx lists MinIO objects under a prefix", "[.][s3][integration][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto ctx = make_live_async_ioctx(*env);
+
+  CHECK(ctx->list_objects(env->bucket, "list/pfx/") ==
+        std::vector<std::string>{"list/pfx/a.parquet", "list/pfx/b.parquet", "list/pfx/c.parquet"});
+}
+
+TEST_CASE("s3_ioctx follows ListObjectsV2 pagination", "[.][s3][integration][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto ctx = make_live_async_ioctx(*env);
+
+  CHECK(ctx->list_objects(env->bucket, "list/pfx/", 1) ==
+        std::vector<std::string>{"list/pfx/a.parquet", "list/pfx/b.parquet", "list/pfx/c.parquet"});
+}
+
+TEST_CASE("s3_ioctx throws when LIST exceeds max_keys instead of truncating",
+          "[.][s3][integration][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto ctx = make_live_async_ioctx(*env);
+
+  CHECK_THROWS_WITH(ctx->list_objects(env->bucket, "list/pfx/", 1, 2),
+                    Catch::Contains("list/pfx/") && Catch::Contains("2"));
+  CHECK(ctx->list_objects(env->bucket, "list/pfx/", 1, 3).size() == 3);
+}
+
+TEST_CASE("s3_ioctx returns an empty vector for no-match prefixes", "[.][s3][integration][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto ctx = make_live_async_ioctx(*env);
+
+  CHECK(ctx->list_objects(env->bucket, "list/nope/").empty());
+}
+
+TEST_CASE("s3_ioctx preserves hive-style nested keys in LIST results",
+          "[.][s3][integration][ioctx]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto ctx = make_live_async_ioctx(*env);
+
+  CHECK(ctx->list_objects(env->bucket, "list/t/") ==
+        std::vector<std::string>{"list/t/date=2026-06-01/part-0.parquet",
+                                 "list/t/date=2026-06-02/part-0.parquet"});
+}
+
 TEST_CASE("async-curl S3 host_read_ranges_async reports validation errors through handler",
           "[.][s3][integration][asynccurl]")
 {
