@@ -52,7 +52,10 @@
 #include <rmm/cuda_stream.hpp>
 
 // cudf
+#include <cudf/io/datasource.hpp>
+#include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/logger.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rapids_logger/logger.hpp>
 
@@ -69,10 +72,13 @@
 // standard library
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 
@@ -123,7 +129,8 @@ static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_sc
   duckdb::ClientContext& ctx,
   std::string const& parquet_path,
   duckdb::vector<duckdb::idx_t> const& projection_indices  = {},
-  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr)
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters = nullptr,
+  duckdb::named_parameter_map_t named_parameters           = {})
 {
   auto& table_function_entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
     ctx, INVALID_CATALOG, DEFAULT_SCHEMA, "parquet_scan");
@@ -135,7 +142,6 @@ static std::unique_ptr<sirius::op::sirius_physical_parquet_scan> make_parquet_sc
   duckdb::vector<duckdb::Value> inputs;
   inputs.emplace_back(parquet_path);
 
-  duckdb::named_parameter_map_t named_parameters;
   duckdb::vector<duckdb::LogicalType> input_table_types;
   duckdb::vector<std::string> input_table_names;
 
@@ -280,6 +286,38 @@ static std::filesystem::path write_parquet_from_table(duckdb::Connection& con,
                       (table_name + "_" + std::to_string(row_group_size) + ".parquet");
   write_parquet_from_table_to_path(con, table_name, parquet_path, row_group_size);
   return parquet_path;
+}
+
+static std::filesystem::path integration_parquet_fixture(std::string_view file_name)
+{
+  return std::filesystem::path{SIRIUS_PROJECT_ROOT} / "test" / "cpp" / "integration" / "data" /
+         "parquet" / file_name;
+}
+
+static std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer(
+  cudf::io::datasource& source)
+{
+  auto constexpr footer_tail_size = sizeof(cudf::io::parquet::file_ender_s);
+  auto const file_size            = source.size();
+  REQUIRE(file_size >= footer_tail_size);
+
+  auto tail = source.host_read(file_size - footer_tail_size, footer_tail_size);
+
+  std::uint32_t footer_size = 0;
+  std::memcpy(&footer_size, tail->data(), sizeof(footer_size));
+  REQUIRE(file_size >= footer_tail_size + footer_size);
+
+  return source.host_read(file_size - footer_tail_size - footer_size, footer_size);
+}
+
+static cudf::io::parquet::FileMetaData read_parquet_metadata(std::filesystem::path const& path)
+{
+  auto source = cudf::io::datasource::create(path.string());
+  auto footer = read_parquet_footer(*source);
+  auto opts   = cudf::io::parquet_reader_options::builder().build();
+  cudf::io::parquet::experimental::hybrid_scan_reader reader{
+    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), opts};
+  return reader.parquet_metadata();
 }
 
 static void validate_scanned_batches_suppress_cudf(
@@ -647,6 +685,56 @@ static size_t count_row_group_partitions(
   return global_state->get_num_row_group_partitions();
 }
 
+static void run_projected_nested_schema_evolution_scan()
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+
+  auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+  auto& mem_mgr    = sirius_ctx->get_memory_manager();
+  auto* mem_space  = get_space(mem_mgr, Tier::HOST);
+  REQUIRE(mem_space != nullptr);
+
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
+  duckdb::named_parameter_map_t named_parameters;
+  named_parameters["union_by_name"] = duckdb::Value::BOOLEAN(true);
+
+  auto physical_scan =
+    make_parquet_scan(client_ctx,
+                      integration_parquet_fixture("nested_struct*.parquet").string(),
+                      duckdb::vector<duckdb::idx_t>{0, 1},
+                      nullptr,
+                      std::move(named_parameters));
+  REQUIRE(physical_scan);
+
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan.get(), 200000, make_test_gpu_ioctxs());
+
+  cucascade::shared_data_repository data_repo;
+  rmm::cuda_stream stream;
+
+  uint64_t task_id = 1;
+  while (auto partition = global_state->claim_next_rg_partition()) {
+    auto local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
+      *global_state, std::move(*partition));
+    auto reservation = mem_mgr.request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+      local_state->get_reserved_compressed_bytes());
+    local_state->set_reservation(std::move(reservation));
+
+    auto task = std::make_unique<op::scan::parquet_scan_task>(
+      task_id++, &data_repo, std::move(local_state), global_state);
+    task->execute(stream.view());
+  }
+
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
+}
+
 template <typename TableSetupFn, typename FilterFactoryFn>
 static void run_row_group_pruning_test(std::string const& table_name,
                                        size_t row_group_size,
@@ -743,6 +831,34 @@ TEST_CASE("parquet_scan_task - projected flat columns with nested schema",
                         std::move(projection_indices),
                         validate_projected_id_price_batches,
                         create_synthetic_table_with_nested_list);
+}
+
+TEST_CASE("parquet_scan_task - projected top-level nested column is accepted",
+          "[parquet_scan_task][projection][nested_schema]")
+{
+  auto meta = read_parquet_metadata(integration_parquet_fixture("nested_list.parquet"));
+
+  CHECK(sirius::op::scan::detail::projected_columns_are_flat(meta, {"id"}));
+  CHECK(sirius::op::scan::detail::projected_columns_are_flat(meta, {"id", "items"}));
+}
+
+TEST_CASE("parquet_scan_task - nested schema evolution rejects null injection clearly",
+          "[parquet_scan_task][multi_file][projection][nested_schema][schema_evolution]")
+{
+  std::string error;
+  try {
+    run_projected_nested_schema_evolution_scan();
+  } catch (std::exception const& e) {
+    error = e.what();
+  }
+
+  REQUIRE(!error.empty());
+  INFO(error);
+  CHECK(error.find("nested column") != std::string::npos);
+  CHECK(error.find("payload") != std::string::npos);
+  CHECK(error.find("schema evolution") != std::string::npos);
+  CHECK((error.find("unsupported") != std::string::npos ||
+         error.find("not supported") != std::string::npos));
 }
 
 TEST_CASE("parquet_scan_task - empty table", "[parquet_scan_task][edge_case][shared_context]")

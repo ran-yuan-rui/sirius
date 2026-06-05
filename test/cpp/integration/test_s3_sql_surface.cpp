@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -354,6 +355,14 @@ std::string gpu_execution_sql(std::string const& inner_sql)
   return "SELECT * FROM gpu_execution('" + escaped + "')";
 }
 
+void set_gpu_execution(duckdb::Connection& con, bool enabled)
+{
+  auto result = con.Query(std::string{"SET gpu_execution = "} + (enabled ? "true" : "false"));
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+}
+
 std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
 {
   std::vector<std::vector<std::string>> rows;
@@ -446,6 +455,59 @@ std::string s3_sirius_parquet_scan(s3_test_env const& env, std::string_view tabl
 {
   auto const key = "parquet/" + std::string{table} + ".parquet";
   return "sirius_read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
+}
+
+std::string lowercase(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+void require_rows_equal(duckdb::MaterializedQueryResult& actual,
+                        duckdb::MaterializedQueryResult& expected)
+{
+  REQUIRE(actual.RowCount() == expected.RowCount());
+  REQUIRE(actual.ColumnCount() == expected.ColumnCount());
+  CHECK(collect_rows(actual) == collect_rows(expected));
+}
+
+void require_s3_gpu_matches_local_oracle(s3_sql_fixture& fixture,
+                                         std::string const& s3_sql,
+                                         std::string const& local_sql,
+                                         std::vector<duckdb::idx_t> tolerant_columns = {})
+{
+  auto actual = require_query_ok(fixture.con, gpu_execution_sql(s3_sql));
+
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+  auto expected = require_query_ok(baseline_con, local_sql);
+
+  INFO("s3_sql=" << s3_sql);
+  INFO("local_sql=" << local_sql);
+  if (tolerant_columns.empty()) {
+    require_rows_equal(*actual, *expected);
+  } else {
+    check_rows_equal_with_tolerant_columns(*actual, *expected, tolerant_columns);
+  }
+}
+
+void require_nested_operation_unsupported(s3_sql_fixture& fixture,
+                                          std::string const& sql,
+                                          std::string_view column_name)
+{
+  auto result = fixture.con.Query(gpu_execution_sql(sql));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+
+  auto const error       = result->GetError();
+  auto const lower_error = lowercase(error);
+  INFO(error);
+  CHECK(lower_error.find("nested column operation") != std::string::npos);
+  CHECK((lower_error.find("unsupported") != std::string::npos ||
+         lower_error.find("not supported") != std::string::npos));
+  CHECK(error.find(std::string{column_name}) != std::string::npos);
 }
 
 std::string s3_large_lineitem_uri(s3_test_env const& env)
@@ -1243,6 +1305,78 @@ TEST_CASE("gpu_execution S3 SQL results match with the async backend flag",
   CHECK(async.second > 0);
 }
 
+TEST_CASE("transparent S3 nested parquet projections match local DuckDB CPU",
+          "[.][s3][integration][sql][gpu_execution][nested]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  struct nested_projection_case {
+    std::string_view table;
+    std::string_view select_list;
+  };
+
+  constexpr std::array<nested_projection_case, 5> cases{{
+    {"nested_struct", "id, payload"},
+    {"nested_list", "id, items"},
+    {"nested_map", "id, attrs"},
+    {"nested_deep", "id, struct_of_list, list_of_struct, tail"},
+    {"nested_chunk_boundary", "id, items, payload, attrs, tail"},
+  }};
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  duckdb::DuckDB baseline_db(nullptr);
+  duckdb::Connection baseline_con(baseline_db);
+
+  for (auto const& test_case : cases) {
+    auto const s3_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
+                          s3_parquet_scan(*env, test_case.table) + " ORDER BY id";
+    auto const local_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
+                             local_parquet_scan(test_case.table) + " ORDER BY id";
+
+    auto s3_result       = require_query_ok(fixture.con, s3_query);
+    auto baseline_result = require_query_ok(baseline_con, local_query);
+
+    INFO("table=" << test_case.table);
+    require_rows_equal(*s3_result, *baseline_result);
+  }
+}
+
+TEST_CASE("gpu_execution rejects operations on nested S3 parquet columns cleanly",
+          "[.][s3][integration][sql][gpu_execution][nested][unsupported]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+
+  auto const struct_scan = s3_parquet_scan(*env, "nested_struct");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + struct_scan + " WHERE payload IS NULL", "payload");
+
+  require_nested_operation_unsupported(
+    fixture,
+    "SELECT id FROM " + struct_scan + " WHERE payload = struct_pack(a := 10, b := 'alpha')",
+    "payload");
+
+  auto const list_scan = s3_parquet_scan(*env, "nested_list");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + list_scan + " WHERE items IS NULL", "items");
+
+  require_nested_operation_unsupported(
+    fixture, "SELECT items, count(*) FROM " + list_scan + " GROUP BY items", "items");
+
+  require_nested_operation_unsupported(
+    fixture,
+    "SELECT l.id FROM " + list_scan + " l JOIN " + list_scan + " r ON l.items = r.items",
+    "items");
+
+  auto const map_scan = s3_parquet_scan(*env, "nested_map");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + map_scan + " WHERE attrs IS NULL", "attrs");
+}
+
 TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",
           "[.][s3][aws][live][sql][gpu_execution]")
 {
@@ -1352,18 +1486,19 @@ TEST_CASE("gpu_execution aggregates real AWS S3 parquet through Sirius SigV4",
   }
 }
 
-TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
+TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
           "[.][s3][integration][sql][gpu_execution][fallback]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }
 
   s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
   auto const s3_query =
     "SELECT n_nationkey, ROW_NUMBER() OVER (ORDER BY n_nationkey) AS rn "
     "FROM " +
     s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
-  auto result = fixture.con.Query(gpu_execution_sql(s3_query));
+  auto result = fixture.con.Query(s3_query);
   REQUIRE(result);
   REQUIRE(result->HasError());
   auto const error = result->GetError();
@@ -1373,22 +1508,6 @@ TEST_CASE("gpu_execution S3 window query reports unsupported S3 CPU fallback",
          error.find("WINDOW") != std::string::npos));
   CHECK(error.find("No filesystem") == std::string::npos);
   CHECK(error.find("no filesystem") == std::string::npos);
-}
-
-TEST_CASE("DuckDB CPU read_parquet does not register a Sirius S3 filesystem",
-          "[.][s3][integration][sql][filesystem]")
-{
-  auto env = read_s3_test_env();
-  if (skip_if_no_s3_env(env)) { return; }
-
-  s3_sql_fixture fixture(*env);
-  auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
-  auto result    = fixture.con.Query("SELECT count(*) FROM read_parquet('" + uri + "')");
-  REQUIRE(result);
-  REQUIRE(result->HasError());
-  auto const error = result->GetError();
-  INFO(error);
-  CHECK((error.find("s3") != std::string::npos || error.find("S3") != std::string::npos));
 }
 
 TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
@@ -1522,6 +1641,201 @@ TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups",
   REQUIRE(baseline_result->RowCount() == 1);
   REQUIRE(baseline_result->ColumnCount() == 3);
   CHECK(collect_rows(*s3_result) == collect_rows(*baseline_result));
+}
+
+TEST_CASE("gpu_execution S3 SQL outer joins match local parquet oracles",
+          "[.][s3][integration][sql][gpu_execution][t1-outer-join]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+
+  auto left_join_query = [](std::string const& region_scan, std::string const& nation_scan) {
+    return "SELECT r.r_regionkey, n.n_nationkey "
+           "FROM " +
+           region_scan + " r LEFT JOIN " + nation_scan +
+           " n ON n.n_regionkey = r.r_regionkey AND n.n_nationkey > 100 "
+           "ORDER BY r.r_regionkey, n.n_nationkey NULLS FIRST";
+  };
+  require_s3_gpu_matches_local_oracle(
+    fixture,
+    left_join_query(s3_sirius_parquet_scan(*env, "region"), s3_sirius_parquet_scan(*env, "nation")),
+    left_join_query(local_parquet_scan("region"), local_parquet_scan("nation")));
+
+  auto right_join_query = [](std::string const& nation_scan, std::string const& region_scan) {
+    return "SELECT r.r_regionkey, n.n_nationkey "
+           "FROM " +
+           nation_scan + " n RIGHT JOIN " + region_scan +
+           " r ON n.n_regionkey = r.r_regionkey AND n.n_nationkey > 100 "
+           "ORDER BY r.r_regionkey, n.n_nationkey NULLS FIRST";
+  };
+  require_s3_gpu_matches_local_oracle(
+    fixture,
+    right_join_query(s3_sirius_parquet_scan(*env, "nation"),
+                     s3_sirius_parquet_scan(*env, "region")),
+    right_join_query(local_parquet_scan("nation"), local_parquet_scan("region")));
+
+  auto populated_left_join_query = [](std::string const& nation_scan,
+                                      std::string const& supplier_scan) {
+    return "SELECT n.n_nationkey, count(s.s_suppkey) AS c "
+           "FROM " +
+           nation_scan + " n LEFT JOIN " + supplier_scan +
+           " s ON s.s_nationkey = n.n_nationkey "
+           "GROUP BY n.n_nationkey "
+           "ORDER BY n.n_nationkey";
+  };
+  require_s3_gpu_matches_local_oracle(
+    fixture,
+    populated_left_join_query(s3_sirius_parquet_scan(*env, "nation"),
+                              s3_sirius_parquet_scan(*env, "supplier")),
+    populated_left_join_query(local_parquet_scan("nation"), local_parquet_scan("supplier")));
+}
+
+TEST_CASE("gpu_execution S3 SQL group by having and count distinct match local parquet",
+          "[.][s3][integration][sql][gpu_execution][t2-groupby]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto group_query = [](std::string const& lineitem_scan) {
+    return "SELECT l_returnflag, l_linestatus, count(*) AS cnt, "
+           "count(DISTINCT l_orderkey) AS distinct_orders, sum(l_quantity) AS qty "
+           "FROM " +
+           lineitem_scan +
+           " GROUP BY l_returnflag, l_linestatus "
+           "HAVING count(*) > 100 "
+           "ORDER BY l_returnflag, l_linestatus";
+  };
+
+  s3_sql_fixture fixture(*env);
+  require_s3_gpu_matches_local_oracle(fixture,
+                                      group_query(s3_sirius_parquet_scan(*env, "lineitem")),
+                                      group_query(local_parquet_scan("lineitem")),
+                                      {4});
+}
+
+TEST_CASE("gpu_execution S3 SQL string predicates match local parquet",
+          "[.][s3][integration][sql][gpu_execution][t3-string]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+
+  auto green_count_query = [](std::string const& part_scan) {
+    return "SELECT count(*) AS c FROM " + part_scan + " WHERE p_name LIKE '%green%' ORDER BY c";
+  };
+  require_s3_gpu_matches_local_oracle(fixture,
+                                      green_count_query(s3_sirius_parquet_scan(*env, "part")),
+                                      green_count_query(local_parquet_scan("part")));
+
+  auto forest_query = [](std::string const& part_scan) {
+    return "SELECT p_partkey, p_name FROM " + part_scan +
+           " WHERE p_name LIKE 'forest%' ORDER BY p_partkey LIMIT 100";
+  };
+  require_s3_gpu_matches_local_oracle(fixture,
+                                      forest_query(s3_sirius_parquet_scan(*env, "part")),
+                                      forest_query(local_parquet_scan("part")));
+
+  auto nation_in_query = [](std::string const& nation_scan) {
+    return "SELECT n_nationkey, n_name FROM " + nation_scan +
+           " WHERE n_name IN ('FRANCE', 'GERMANY', 'BRAZIL') ORDER BY n_nationkey";
+  };
+  require_s3_gpu_matches_local_oracle(fixture,
+                                      nation_in_query(s3_sirius_parquet_scan(*env, "nation")),
+                                      nation_in_query(local_parquet_scan("nation")));
+}
+
+TEST_CASE("gpu_execution mixed local and S3 scans join correctly",
+          "[.][s3][integration][sql][gpu_execution][t4-mixed]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  auto mixed_join_query = [](std::string const& nation_scan, std::string const& supplier_scan) {
+    return "SELECT n.n_name, s.s_name "
+           "FROM " +
+           nation_scan + " n JOIN " + supplier_scan +
+           " s ON s.s_nationkey = n.n_nationkey "
+           "WHERE n.n_regionkey = 1 "
+           "ORDER BY s.s_suppkey "
+           "LIMIT 50";
+  };
+
+  s3_sql_fixture fixture(*env);
+  require_s3_gpu_matches_local_oracle(
+    fixture,
+    mixed_join_query(local_parquet_scan("nation"), s3_sirius_parquet_scan(*env, "supplier")),
+    mixed_join_query(local_parquet_scan("nation"), local_parquet_scan("supplier")));
+}
+
+TEST_CASE("gpu_execution S3 SQL null decimal and timestamp edges match local parquet",
+          "[.][s3][integration][sql][gpu_execution][t5-edge-types]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+
+  auto edge_filter_query = [](std::string const& edge_scan) {
+    return "SELECT id, n, d, ts FROM " + edge_scan + " WHERE n IS NULL OR d < 0 ORDER BY id";
+  };
+  require_s3_gpu_matches_local_oracle(fixture,
+                                      edge_filter_query(s3_sirius_parquet_scan(*env, "edge_types")),
+                                      edge_filter_query(local_parquet_scan("edge_types")),
+                                      {2});
+
+  auto edge_aggregate_query = [](std::string const& edge_scan) {
+    return "SELECT count(*) AS total, count(n) AS non_null_n, sum(d) AS sum_d, "
+           "min(ts) AS min_ts, max(ts) AS max_ts "
+           "FROM " +
+           edge_scan + " ORDER BY total";
+  };
+  require_s3_gpu_matches_local_oracle(
+    fixture,
+    edge_aggregate_query(s3_sirius_parquet_scan(*env, "edge_types")),
+    edge_aggregate_query(local_parquet_scan("edge_types")),
+    {2});
+}
+
+TEST_CASE("gpu_execution S3 SQL CTE subquery and ordered limit match local parquet",
+          "[.][s3][integration][sql][gpu_execution][t6-cte]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+
+  auto cte_query = [](std::string const& lineitem_scan, std::string const& orders_scan) {
+    return "WITH rev AS ("
+           "SELECT l_orderkey, sum(l_extendedprice * (1 - l_discount)) AS r "
+           "FROM " +
+           lineitem_scan +
+           " GROUP BY l_orderkey"
+           ") "
+           "SELECT o.o_orderkey, rev.r "
+           "FROM " +
+           orders_scan +
+           " o JOIN rev ON rev.l_orderkey = o.o_orderkey "
+           "WHERE o.o_orderstatus = 'O' "
+           "ORDER BY rev.r DESC, o.o_orderkey "
+           "LIMIT 200";
+  };
+  require_s3_gpu_matches_local_oracle(
+    fixture,
+    cte_query(s3_sirius_parquet_scan(*env, "lineitem"), s3_sirius_parquet_scan(*env, "orders")),
+    cte_query(local_parquet_scan("lineitem"), local_parquet_scan("orders")),
+    {1});
+
+  auto scalar_subquery = [](std::string const& orders_scan) {
+    return "SELECT o_orderkey FROM " + orders_scan +
+           " WHERE o_totalprice > (SELECT avg(o_totalprice) FROM " + orders_scan +
+           ") ORDER BY o_orderkey LIMIT 100";
+  };
+  require_s3_gpu_matches_local_oracle(fixture,
+                                      scalar_subquery(s3_sirius_parquet_scan(*env, "orders")),
+                                      scalar_subquery(local_parquet_scan("orders")));
 }
 
 TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracle",
