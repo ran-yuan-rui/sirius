@@ -263,6 +263,7 @@ struct sirius_memory_limits {
   std::string gpu_usage{"256 MiB"};
   std::string gpu_reservation{"128 MiB"};
   std::string host_capacity{"512 MiB"};
+  std::string host_block_size{"1 MiB"};
   std::string disk_capacity{"2 GiB"};
   std::optional<bool> enable_prefetch_cache;
   std::optional<std::size_t> rest_n_reactors;
@@ -326,7 +327,9 @@ class sirius_config_env_guard {
            "        memory_capacity: "
         << limits.host_capacity
         << "\n"
-           "        block_size: 1 MiB\n"
+           "        block_size: "
+        << limits.host_block_size
+        << "\n"
            "    disk:\n"
            "      - disk_id: 0\n"
            "        mount_path: "
@@ -787,6 +790,7 @@ struct bench_record {
   std::uint64_t payload_bytes_read{0};
   duckdb::idx_t row_count{0};
   double effective_bytes_per_sec{0.0};
+  double effective_mib_per_sec{0.0};
   std::uint64_t chunk_get_ns_total{0};
   std::uint64_t chunk_get_count{0};
   std::uint64_t chunk_get_ns_max{0};
@@ -817,7 +821,8 @@ bench_record make_record(std::string scenario,
   auto seconds = measurement.wall_clock_ms / 1000.0;
   auto effective =
     seconds > 0.0 ? static_cast<double>(dataset_bytes) / seconds : static_cast<double>(0);
-  auto const& micro = measurement.micro;
+  auto effective_mib = effective / (1024.0 * 1024.0);
+  auto const& micro  = measurement.micro;
   return bench_record{std::move(scenario),
                       std::move(transport),
                       std::move(projection),
@@ -832,6 +837,7 @@ bench_record make_record(std::string scenario,
                       measurement.payload_bytes_read,
                       measurement.rows,
                       effective,
+                      effective_mib,
                       micro.chunk_get_ns_total,
                       micro.chunk_get_count,
                       micro.chunk_get_ns_max,
@@ -883,6 +889,26 @@ std::string transport_signature(std::string const& endpoint)
 std::string prefetch_cache_signature(bool enable_prefetch_cache)
 {
   return enable_prefetch_cache ? "on" : "off";
+}
+
+void apply_rest_bench_shape(sirius_memory_limits& limits,
+                            std::vector<std::string> const& columns,
+                            std::optional<std::size_t> rest_max_connections,
+                            std::optional<std::string> host_capacity = std::nullopt)
+{
+  if (columns.size() > 1) {
+    // Wider scans materialize more cuDF columns than the single-column headline
+    // baseline, so give only those scenarios a larger GPU budget.
+    limits.gpu_usage       = "8 GiB";
+    limits.gpu_reservation = "3 GiB";
+  }
+  if (rest_max_connections.value_or(std::size_t{8}) >= std::size_t{32}) {
+    // The REST reactor parks one host bounce slot per connection.  Historical
+    // mc=32 compatibility/headline cells need a larger host tier unless a test
+    // deliberately overrides it to measure tight-host behavior.
+    limits.host_capacity = "12 GiB";
+  }
+  if (host_capacity.has_value()) { limits.host_capacity = *host_capacity; }
 }
 
 fs::path unittest_log_dir()
@@ -1108,6 +1134,7 @@ void write_perf_json(fs::path const& path,
         << "\"payload_bytes_read\": " << r.payload_bytes_read << ", "
         << "\"row_count\": " << r.row_count << ", "
         << "\"effective_bytes_per_sec\": " << r.effective_bytes_per_sec << ", "
+        << "\"effective_mib_per_sec\": " << r.effective_mib_per_sec << ", "
         << "\"chunk_get_ns_total\": " << r.chunk_get_ns_total << ", "
         << "\"chunk_get_count\": " << r.chunk_get_count << ", "
         << "\"chunk_get_ns_max\": " << r.chunk_get_ns_max << ", "
@@ -1169,6 +1196,7 @@ void append_perf_history_jsonl(fs::path const& path,
         << ",\"payload_bytes_read\":" << r.payload_bytes_read << ",\"row_count\":" << r.row_count
         << ",\"wall_clock_ms\":" << std::fixed << std::setprecision(3) << r.wall_clock_ms
         << ",\"effective_bytes_per_sec\":" << r.effective_bytes_per_sec
+        << ",\"effective_mib_per_sec\":" << r.effective_mib_per_sec
         << ",\"retries_total\":" << r.retries_total
         << ",\"terminal_failures_total\":" << r.terminal_failures_total
         << ",\"device_stream_sync_total\":" << r.device_stream_sync_total << "}";
@@ -1198,6 +1226,7 @@ void require_perf_json_schema(fs::path const& path, std::vector<std::string> exp
                    "\"payload_bytes_read\"",
                    "\"row_count\"",
                    "\"effective_bytes_per_sec\"",
+                   "\"effective_mib_per_sec\"",
                    "\"chunk_get_ns_total\"",
                    "\"chunk_get_count\"",
                    "\"chunk_get_ns_max\"",
@@ -1285,6 +1314,59 @@ std::string aws_bench_lineitem_uri(s3_test_env const& env)
   return s3_uri(env.bucket, aws_bench_lineitem_key());
 }
 
+std::string aws_bench_small_key()
+{
+  return env_or("SIRIUS_BENCH_SMALL_S3_KEY", "parquet/nation.parquet");
+}
+
+std::string aws_bench_small_uri(s3_test_env const& env)
+{
+  return s3_uri(env.bucket, aws_bench_small_key());
+}
+
+bench_record run_rest_uri_bench_scenario(
+  s3_test_env const& env,
+  std::string const& uri,
+  std::optional<duckdb::idx_t> expected_rows,
+  std::string scenario,
+  std::string const& endpoint,
+  std::optional<std::string> ca_bundle,
+  bool tls_verify,
+  bool perf_instrumentation,
+  std::vector<std::string> columns,
+  std::optional<std::size_t> rest_max_connections = std::nullopt,
+  std::optional<std::size_t> rest_n_reactors      = std::nullopt,
+  bool enable_prefetch_cache                      = true,
+  std::optional<std::string> signing_mode         = std::nullopt,
+  std::optional<std::string> host_capacity        = std::nullopt)
+{
+  INFO("scenario=" << scenario << " uri=" << uri << " columns=" << columns.size()
+                   << " max_connections=" << rest_max_connections.value_or(std::size_t{8})
+                   << " enable_prefetch_cache=" << enable_prefetch_cache);
+  auto limits                      = large_sirius_memory_limits(enable_prefetch_cache);
+  limits.rest_perf_instrumentation = perf_instrumentation;
+  limits.rest_max_connections      = rest_max_connections;
+  limits.rest_n_reactors           = rest_n_reactors;
+  apply_rest_bench_shape(limits, columns, rest_max_connections, std::move(host_capacity));
+
+  s3_sql_fixture fixture(
+    env, limits, std::move(signing_mode), endpoint, std::move(ca_bundle), tls_verify);
+  auto measurement = run_rest_parquet_scan(fixture, uri, columns);
+  if (expected_rows.has_value()) { CHECK(measurement.rows == *expected_rows); }
+  CHECK(measurement.rows > 0);
+  CHECK(measurement.payload_bytes_read > 0);
+  CHECK(measurement.micro.device_stream_sync_total == 0);
+  CHECK(measurement.micro.terminal_failures_total == 0);
+  return make_record(std::move(scenario),
+                     transport_signature(endpoint),
+                     projection_signature(columns),
+                     rest_max_connections.value_or(std::size_t{8}),
+                     rest_n_reactors.value_or(std::size_t{2}),
+                     prefetch_cache_signature(enable_prefetch_cache),
+                     measurement,
+                     measurement.payload_bytes_read);
+}
+
 bench_record run_rest_minio_bench_scenario(
   s3_test_env const& env,
   large_lineitem_fixture const& large,
@@ -1296,7 +1378,8 @@ bench_record run_rest_minio_bench_scenario(
   std::vector<std::string> columns,
   std::optional<std::size_t> rest_max_connections = std::nullopt,
   std::optional<std::size_t> rest_n_reactors      = std::nullopt,
-  bool enable_prefetch_cache                      = true)
+  bool enable_prefetch_cache                      = true,
+  std::optional<std::string> host_capacity        = std::nullopt)
 {
   INFO("scenario=" << scenario << " columns=" << columns.size()
                    << " max_connections=" << rest_max_connections.value_or(std::size_t{8})
@@ -1306,19 +1389,7 @@ bench_record run_rest_minio_bench_scenario(
   limits.rest_perf_instrumentation = perf_instrumentation;
   limits.rest_max_connections      = rest_max_connections;
   limits.rest_n_reactors           = rest_n_reactors;
-  if (columns.size() > 1) {
-    // The compatibility run mirrors the old #982 seven-column async-S3 baseline.
-    // SF10 materializes a much wider cuDF table than the single-column CI
-    // baseline, so give only that scenario a larger GPU budget.
-    limits.gpu_usage       = "8 GiB";
-    limits.gpu_reservation = "3 GiB";
-  }
-  if (rest_max_connections.value_or(std::size_t{8}) >= std::size_t{32}) {
-    // The historical #982 async-S3 bench used mc=32.  The REST reactor parks one
-    // host bounce slot per connection, so give that compatibility scenario a
-    // larger host budget without changing the production-shape scenarios above.
-    limits.host_capacity = "12 GiB";
-  }
+  apply_rest_bench_shape(limits, columns, rest_max_connections, std::move(host_capacity));
   s3_sql_fixture fixture(env, limits, std::nullopt, endpoint, std::move(ca_bundle), tls_verify);
   auto measurement = run_rest_parquet_scan(fixture, large.uri, columns);
   CHECK(measurement.rows == large.total_num_rows);
@@ -1346,17 +1417,18 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                                          std::string scenario,
                                          std::vector<std::string> columns,
                                          std::size_t rest_max_connections,
-                                         std::optional<duckdb::idx_t> expected_rows)
+                                         std::optional<duckdb::idx_t> expected_rows,
+                                         bool enable_prefetch_cache               = true,
+                                         std::optional<std::string> host_capacity = std::nullopt)
 {
   INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
-                   << " columns=" << columns.size() << " max_connections=" << rest_max_connections);
-  auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
+                   << " columns=" << columns.size() << " max_connections=" << rest_max_connections
+                   << " enable_prefetch_cache=" << enable_prefetch_cache);
+  auto limits                      = large_sirius_memory_limits(enable_prefetch_cache);
   limits.rest_perf_instrumentation = true;
   limits.rest_max_connections      = rest_max_connections;
   limits.rest_n_reactors           = std::size_t{2};
-  limits.gpu_usage                 = "8 GiB";
-  limits.gpu_reservation           = "3 GiB";
-  limits.host_capacity             = "12 GiB";
+  apply_rest_bench_shape(limits, columns, rest_max_connections, std::move(host_capacity));
 
   s3_sql_fixture fixture(env,
                          limits,
@@ -1375,9 +1447,131 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                      projection_signature(columns),
                      rest_max_connections,
                      limits.rest_n_reactors.value(),
-                     prefetch_cache_signature(true),
+                     prefetch_cache_signature(enable_prefetch_cache),
                      measurement,
                      measurement.payload_bytes_read);
+}
+
+rest_bench_measurement run_rest_sql_scan(s3_sql_fixture& fixture,
+                                         std::string const& uri,
+                                         std::string const& sql)
+{
+  auto& rest        = require_rest_ioctx(fixture, uri);
+  auto const before = rest.perf_snapshot();
+  auto const start  = bench_clock::now();
+  auto result       = require_query_ok(fixture.con, gpu_execution_sql(sql));
+  auto const stop   = bench_clock::now();
+  auto const after  = rest.perf_snapshot();
+  auto const micro  = delta_snapshot(after, before);
+  auto const wall   = elapsed_ms(start, stop);
+
+  return rest_bench_measurement{
+    wall, 0.0, 0.0, 0.0, wall, micro.payload_bytes_read_total, result->RowCount(), micro};
+}
+
+bench_record run_rest_sql_bench_scenario(
+  s3_test_env const& env,
+  std::string const& uri,
+  std::string scenario,
+  std::string sql,
+  std::string const& endpoint,
+  std::optional<std::string> ca_bundle,
+  bool tls_verify,
+  bool enable_prefetch_cache,
+  std::optional<std::string> signing_mode         = std::nullopt,
+  std::optional<std::size_t> rest_max_connections = std::size_t{32},
+  std::optional<std::string> host_capacity        = std::nullopt,
+  std::optional<std::string> host_block_size      = std::nullopt)
+{
+  INFO("scenario=" << scenario << " sql=" << sql
+                   << " max_connections=" << rest_max_connections.value_or(std::size_t{8})
+                   << " enable_prefetch_cache=" << enable_prefetch_cache
+                   << " host_block_size=" << host_block_size.value_or(std::string{"1 MiB"}));
+  auto columns                     = bench_single_column_projection();
+  auto limits                      = large_sirius_memory_limits(enable_prefetch_cache);
+  limits.rest_perf_instrumentation = true;
+  limits.rest_max_connections      = rest_max_connections;
+  limits.rest_n_reactors           = std::size_t{2};
+  apply_rest_bench_shape(limits, columns, rest_max_connections, std::move(host_capacity));
+  if (host_block_size.has_value()) { limits.host_block_size = *host_block_size; }
+
+  s3_sql_fixture fixture(
+    env, limits, std::move(signing_mode), endpoint, std::move(ca_bundle), tls_verify);
+  auto measurement = run_rest_sql_scan(fixture, uri, sql);
+  CHECK(measurement.rows > 0);
+  CHECK(measurement.payload_bytes_read > 0);
+  CHECK(measurement.wall_clock_ms > 0.0);
+  CHECK(measurement.scan_ms > 0.0);
+  CHECK(measurement.micro.device_stream_sync_total == 0);
+  CHECK(measurement.micro.terminal_failures_total == 0);
+  return make_record(std::move(scenario),
+                     transport_signature(endpoint),
+                     "sql",
+                     rest_max_connections.value_or(std::size_t{8}),
+                     limits.rest_n_reactors.value(),
+                     prefetch_cache_signature(enable_prefetch_cache),
+                     measurement,
+                     measurement.payload_bytes_read);
+}
+
+std::array<bench_record, 2> run_rest_repeat_bench_scenario(
+  s3_test_env const& env,
+  std::string const& uri,
+  std::string pass1_scenario,
+  std::string pass2_scenario,
+  std::string const& endpoint,
+  std::optional<std::string> ca_bundle,
+  bool tls_verify,
+  bool perf_instrumentation,
+  std::vector<std::string> columns,
+  duckdb::idx_t expected_rows,
+  bool enable_prefetch_cache,
+  std::optional<std::string> signing_mode         = std::nullopt,
+  std::optional<std::size_t> rest_max_connections = std::size_t{32},
+  std::optional<std::size_t> rest_n_reactors      = std::size_t{2},
+  std::optional<std::string> host_capacity        = std::nullopt)
+{
+  auto limits                      = large_sirius_memory_limits(enable_prefetch_cache);
+  limits.rest_perf_instrumentation = perf_instrumentation;
+  limits.rest_max_connections      = rest_max_connections;
+  limits.rest_n_reactors           = rest_n_reactors;
+  apply_rest_bench_shape(limits, columns, rest_max_connections, std::move(host_capacity));
+
+  s3_sql_fixture fixture(
+    env, limits, std::move(signing_mode), endpoint, std::move(ca_bundle), tls_verify);
+
+  auto first  = run_rest_parquet_scan(fixture, uri, columns);
+  auto second = run_rest_parquet_scan(fixture, uri, columns);
+  CHECK(first.rows == expected_rows);
+  CHECK(second.rows == expected_rows);
+  CHECK(first.payload_bytes_read > 0);
+  CHECK(second.payload_bytes_read > 0);
+  CHECK(first.micro.device_stream_sync_total == 0);
+  CHECK(second.micro.device_stream_sync_total == 0);
+  CHECK(first.micro.terminal_failures_total == 0);
+  CHECK(second.micro.terminal_failures_total == 0);
+
+  auto const max_connections = rest_max_connections.value_or(std::size_t{8});
+  auto const reactors        = rest_n_reactors.value_or(std::size_t{2});
+  auto const transport       = transport_signature(endpoint);
+  auto const projection      = projection_signature(columns);
+  auto const cache           = prefetch_cache_signature(enable_prefetch_cache);
+  return {make_record(std::move(pass1_scenario),
+                      transport,
+                      projection,
+                      max_connections,
+                      reactors,
+                      cache,
+                      first,
+                      first.payload_bytes_read),
+          make_record(std::move(pass2_scenario),
+                      transport,
+                      projection,
+                      max_connections,
+                      reactors,
+                      cache,
+                      second,
+                      second.payload_bytes_read)};
 }
 
 std::string explain_text(duckdb::Connection& con, std::string const& sql)
@@ -1658,7 +1852,7 @@ TEST_CASE("S3 REST bench perf instrumentation gate keeps micro counters zero", "
 
   auto record = run_rest_minio_bench_scenario(*env,
                                               *large,
-                                              "async_http_gate_off",
+                                              "rest_reactor_http_gate_off",
                                               env->endpoint,
                                               std::nullopt,
                                               false,
@@ -1699,13 +1893,18 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
   auto constexpr backend = std::string_view{"rest_minio"};
   auto baseline_json     = read_optional_text_file(perf_baseline_path(backend));
   std::vector<bench_record> records;
-  records.reserve(4);
+  records.reserve(26);
+  auto append_record = [&](bench_record record) {
+    attach_baseline_comparison(record, baseline_json, backend);
+    records.push_back(std::move(record));
+  };
 
-  // compat_* mirrors the old async-S3 benchmark shape: seven projected columns,
-  // mc=32, and no scan-manager prefetch cache mixed into the raw S3 read path.
-  auto compat_http  = run_rest_minio_bench_scenario(*env,
+  // rest_reactor_compat_* mirrors the old async-S3 benchmark shape: seven
+  // projected columns, mc=32, and no scan-manager prefetch cache mixed into the
+  // raw S3 read path.
+  auto compat_http     = run_rest_minio_bench_scenario(*env,
                                                    *large,
-                                                   "compat_http",
+                                                   "rest_reactor_compat_http",
                                                    env->endpoint,
                                                    std::nullopt,
                                                    false,
@@ -1714,9 +1913,9 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
                                                    std::size_t{32},
                                                    std::size_t{1},
                                                    /*enable_prefetch_cache=*/false);
-  auto compat_https = run_rest_minio_bench_scenario(*env,
+  auto compat_https    = run_rest_minio_bench_scenario(*env,
                                                     *large,
-                                                    "compat_https",
+                                                    "rest_reactor_compat_https",
                                                     env->https_endpoint,
                                                     env->ca_bundle_path,
                                                     true,
@@ -1725,25 +1924,59 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
                                                     std::size_t{32},
                                                     std::size_t{1},
                                                     /*enable_prefetch_cache=*/false);
-  auto http         = run_rest_minio_bench_scenario(*env,
+  auto http            = run_rest_minio_bench_scenario(*env,
                                             *large,
-                                            "async_http",
+                                            "rest_reactor_http",
                                             env->endpoint,
                                             std::nullopt,
                                             false,
                                             /*perf_instrumentation=*/true,
                                             bench_single_column_projection());
-  auto https        = run_rest_minio_bench_scenario(*env,
+  auto https           = run_rest_minio_bench_scenario(*env,
                                              *large,
-                                             "async_https",
+                                             "rest_reactor_https",
                                              env->https_endpoint,
                                              env->ca_bundle_path,
                                              true,
                                              /*perf_instrumentation=*/true,
                                              bench_single_column_projection());
+  auto http_cache_off  = run_rest_minio_bench_scenario(*env,
+                                                      *large,
+                                                      "rest_reactor_http_cache_off",
+                                                      env->endpoint,
+                                                      std::nullopt,
+                                                      false,
+                                                      /*perf_instrumentation=*/true,
+                                                      bench_single_column_projection(),
+                                                      std::nullopt,
+                                                      std::nullopt,
+                                                      /*enable_prefetch_cache=*/false);
+  auto https_cache_off = run_rest_minio_bench_scenario(*env,
+                                                       *large,
+                                                       "rest_reactor_https_cache_off",
+                                                       env->https_endpoint,
+                                                       env->ca_bundle_path,
+                                                       true,
+                                                       /*perf_instrumentation=*/true,
+                                                       bench_single_column_projection(),
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       /*enable_prefetch_cache=*/false);
+  auto gate_off        = run_rest_minio_bench_scenario(*env,
+                                                *large,
+                                                "rest_reactor_http_gate_off",
+                                                env->endpoint,
+                                                std::nullopt,
+                                                false,
+                                                /*perf_instrumentation=*/false,
+                                                bench_single_column_projection());
 
-  for (auto const& r :
-       {std::cref(http), std::cref(https), std::cref(compat_http), std::cref(compat_https)}) {
+  for (auto const& r : {std::cref(http),
+                        std::cref(https),
+                        std::cref(http_cache_off),
+                        std::cref(https_cache_off),
+                        std::cref(compat_http),
+                        std::cref(compat_https)}) {
     auto const& record = r.get();
     CHECK(record.row_count == large->total_num_rows);
     CHECK(record.payload_bytes_read > 0);
@@ -1761,9 +1994,17 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
     CHECK(record.device_stream_sync_total == 0);
     CHECK(record.terminal_failures_total == 0);
   }
+  CHECK(gate_off.row_count == large->total_num_rows);
+  CHECK(gate_off.payload_bytes_read > 0);
+  CHECK(gate_off.chunk_get_count == 0);
+  CHECK(gate_off.queue_wait_count == 0);
+  CHECK(gate_off.device_stream_sync_total == 0);
+  CHECK(gate_off.terminal_failures_total == 0);
 
   CHECK(http.row_count == https.row_count);
   CHECK(http.payload_bytes_read == https.payload_bytes_read);
+  CHECK(http_cache_off.row_count == https_cache_off.row_count);
+  CHECK(http_cache_off.payload_bytes_read == https_cache_off.payload_bytes_read);
   CHECK(compat_http.row_count == compat_https.row_count);
   CHECK(compat_http.payload_bytes_read == compat_https.payload_bytes_read);
   if (https.footer_fetch_ms > http.footer_fetch_ms * 3.0) {
@@ -1774,30 +2015,256 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
     WARN("HTTPS compat footer_fetch_ms is more than 3x HTTP on this MinIO run: http="
          << compat_http.footer_fetch_ms << "ms https=" << compat_https.footer_fetch_ms << "ms");
   }
-  WARN("S3 REST perf async_http throughput=" << http.effective_bytes_per_sec
-                                             << " B/s footer_fetch_ms=" << http.footer_fetch_ms
-                                             << " chunk_get_ms_mean=" << http.chunk_get_ms_mean);
-  WARN("S3 REST perf async_https throughput=" << https.effective_bytes_per_sec
-                                              << " B/s footer_fetch_ms=" << https.footer_fetch_ms
-                                              << " chunk_get_ms_mean=" << https.chunk_get_ms_mean);
-  WARN("S3 REST perf compat_http throughput="
-       << compat_http.effective_bytes_per_sec << " B/s footer_fetch_ms="
-       << compat_http.footer_fetch_ms << " chunk_get_ms_mean=" << compat_http.chunk_get_ms_mean
-       << " chunk_get_count=" << compat_http.chunk_get_count);
-  WARN("S3 REST perf compat_https throughput="
-       << compat_https.effective_bytes_per_sec << " B/s footer_fetch_ms="
-       << compat_https.footer_fetch_ms << " chunk_get_ms_mean=" << compat_https.chunk_get_ms_mean
-       << " chunk_get_count=" << compat_https.chunk_get_count);
 
-  attach_baseline_comparison(http, baseline_json, backend);
-  attach_baseline_comparison(https, baseline_json, backend);
-  attach_baseline_comparison(compat_http, baseline_json, backend);
-  attach_baseline_comparison(compat_https, baseline_json, backend);
-  records.push_back(std::move(http));
-  records.push_back(std::move(https));
-  records.push_back(std::move(compat_http));
-  records.push_back(std::move(compat_https));
-  REQUIRE(records.size() >= 4);
+  auto repeat_on  = run_rest_repeat_bench_scenario(*env,
+                                                  large->uri,
+                                                  "rest_reactor_projected_repeat_pass1",
+                                                  "rest_reactor_projected_repeat_pass2",
+                                                  env->endpoint,
+                                                  std::nullopt,
+                                                  false,
+                                                  /*perf_instrumentation=*/true,
+                                                  bench_single_column_projection(),
+                                                  large->total_num_rows,
+                                                  /*enable_prefetch_cache=*/true);
+  auto repeat_off = run_rest_repeat_bench_scenario(*env,
+                                                   large->uri,
+                                                   "rest_reactor_projected_repeat_cache_off_pass1",
+                                                   "rest_reactor_projected_repeat_cache_off_pass2",
+                                                   env->endpoint,
+                                                   std::nullopt,
+                                                   false,
+                                                   /*perf_instrumentation=*/true,
+                                                   bench_single_column_projection(),
+                                                   large->total_num_rows,
+                                                   /*enable_prefetch_cache=*/false);
+
+  auto const projected_sql = "SELECT sum(l_orderkey) FROM " + s3_large_lineitem_scan(*env);
+  auto const q1_sql        = tpch_q1_shape_query(s3_large_lineitem_scan(*env));
+  auto sql_projected       = run_rest_sql_bench_scenario(*env,
+                                                   large->uri,
+                                                   "rest_reactor_sql_projected",
+                                                   projected_sql,
+                                                   env->endpoint,
+                                                   std::nullopt,
+                                                   false,
+                                                   /*enable_prefetch_cache=*/true);
+  auto sql_projected_off   = run_rest_sql_bench_scenario(*env,
+                                                       large->uri,
+                                                       "rest_reactor_sql_projected_cache_off",
+                                                       projected_sql,
+                                                       env->endpoint,
+                                                       std::nullopt,
+                                                       false,
+                                                       /*enable_prefetch_cache=*/false);
+  auto sql_q1              = run_rest_sql_bench_scenario(*env,
+                                            large->uri,
+                                            "rest_reactor_sql_q1",
+                                            q1_sql,
+                                            env->endpoint,
+                                            std::nullopt,
+                                            false,
+                                            /*enable_prefetch_cache=*/true);
+  auto sql_q1_off          = run_rest_sql_bench_scenario(*env,
+                                                large->uri,
+                                                "rest_reactor_sql_q1_cache_off",
+                                                q1_sql,
+                                                env->endpoint,
+                                                std::nullopt,
+                                                false,
+                                                /*enable_prefetch_cache=*/false);
+  auto sql_blk1024         = run_rest_sql_bench_scenario(*env,
+                                                 large->uri,
+                                                 "rest_reactor_sql_projected_blk1024",
+                                                 projected_sql,
+                                                 env->endpoint,
+                                                 std::nullopt,
+                                                 false,
+                                                 /*enable_prefetch_cache=*/true,
+                                                 std::nullopt,
+                                                 std::size_t{32},
+                                                 std::nullopt,
+                                                 std::string{"1 MiB"});
+  auto sql_blk1024_off     = run_rest_sql_bench_scenario(*env,
+                                                     large->uri,
+                                                     "rest_reactor_sql_projected_blk1024_cache_off",
+                                                     projected_sql,
+                                                     env->endpoint,
+                                                     std::nullopt,
+                                                     false,
+                                                     /*enable_prefetch_cache=*/false,
+                                                     std::nullopt,
+                                                     std::size_t{32},
+                                                     std::nullopt,
+                                                     std::string{"1 MiB"});
+  auto sql_blk256          = run_rest_sql_bench_scenario(*env,
+                                                large->uri,
+                                                "rest_reactor_sql_projected_blk256",
+                                                projected_sql,
+                                                env->endpoint,
+                                                std::nullopt,
+                                                false,
+                                                /*enable_prefetch_cache=*/true,
+                                                std::nullopt,
+                                                std::size_t{32},
+                                                std::nullopt,
+                                                std::string{"256 KiB"});
+  auto sql_blk256_off      = run_rest_sql_bench_scenario(*env,
+                                                    large->uri,
+                                                    "rest_reactor_sql_projected_blk256_cache_off",
+                                                    projected_sql,
+                                                    env->endpoint,
+                                                    std::nullopt,
+                                                    false,
+                                                    /*enable_prefetch_cache=*/false,
+                                                    std::nullopt,
+                                                    std::size_t{32},
+                                                    std::nullopt,
+                                                    std::string{"256 KiB"});
+  auto sql_blk64           = run_rest_sql_bench_scenario(*env,
+                                               large->uri,
+                                               "rest_reactor_sql_projected_blk64",
+                                               projected_sql,
+                                               env->endpoint,
+                                               std::nullopt,
+                                               false,
+                                               /*enable_prefetch_cache=*/true,
+                                               std::nullopt,
+                                               std::size_t{32},
+                                               std::nullopt,
+                                               std::string{"64 KiB"});
+  auto sql_blk64_off       = run_rest_sql_bench_scenario(*env,
+                                                   large->uri,
+                                                   "rest_reactor_sql_projected_blk64_cache_off",
+                                                   projected_sql,
+                                                   env->endpoint,
+                                                   std::nullopt,
+                                                   false,
+                                                   /*enable_prefetch_cache=*/false,
+                                                   std::nullopt,
+                                                   std::size_t{32},
+                                                   std::nullopt,
+                                                   std::string{"64 KiB"});
+  for (auto const& r : {std::cref(sql_projected),
+                        std::cref(sql_projected_off),
+                        std::cref(sql_q1),
+                        std::cref(sql_q1_off),
+                        std::cref(sql_blk1024),
+                        std::cref(sql_blk1024_off),
+                        std::cref(sql_blk256),
+                        std::cref(sql_blk256_off),
+                        std::cref(sql_blk64),
+                        std::cref(sql_blk64_off)}) {
+    CHECK(r.get().chunk_get_count > 0);
+    CHECK(r.get().queue_wait_count > 0);
+    CHECK(r.get().payload_bytes_read > 0);
+  }
+  CHECK(sql_blk1024_off.payload_bytes_read == sql_blk256_off.payload_bytes_read);
+  CHECK(sql_blk1024_off.payload_bytes_read == sql_blk64_off.payload_bytes_read);
+
+  auto const nation_uri = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto small            = run_rest_uri_bench_scenario(*env,
+                                           nation_uri,
+                                           duckdb::idx_t{25},
+                                           "rest_reactor_small_object",
+                                           env->endpoint,
+                                           std::nullopt,
+                                           false,
+                                           /*perf_instrumentation=*/true,
+                                           std::vector<std::string>{"n_nationkey"});
+  auto small_off        = run_rest_uri_bench_scenario(*env,
+                                               nation_uri,
+                                               duckdb::idx_t{25},
+                                               "rest_reactor_small_object_cache_off",
+                                               env->endpoint,
+                                               std::nullopt,
+                                               false,
+                                               /*perf_instrumentation=*/true,
+                                               std::vector<std::string>{"n_nationkey"},
+                                               std::nullopt,
+                                               std::nullopt,
+                                               /*enable_prefetch_cache=*/false);
+  auto tight            = run_rest_minio_bench_scenario(*env,
+                                             *large,
+                                             "rest_reactor_projected_tight_host",
+                                             env->endpoint,
+                                             std::nullopt,
+                                             false,
+                                             /*perf_instrumentation=*/true,
+                                             bench_single_column_projection(),
+                                             std::size_t{32},
+                                             std::size_t{2},
+                                             /*enable_prefetch_cache=*/true,
+                                             std::string{"4 GiB"});
+  auto tight_off        = run_rest_minio_bench_scenario(*env,
+                                                 *large,
+                                                 "rest_reactor_projected_tight_host_cache_off",
+                                                 env->endpoint,
+                                                 std::nullopt,
+                                                 false,
+                                                 /*perf_instrumentation=*/true,
+                                                 bench_single_column_projection(),
+                                                 std::size_t{32},
+                                                 std::size_t{2},
+                                                 /*enable_prefetch_cache=*/false,
+                                                 std::string{"4 GiB"});
+
+  for (auto const& r : {std::cref(http),
+                        std::cref(https),
+                        std::cref(http_cache_off),
+                        std::cref(https_cache_off),
+                        std::cref(compat_http),
+                        std::cref(compat_https),
+                        std::cref(gate_off),
+                        std::cref(repeat_on[0]),
+                        std::cref(repeat_on[1]),
+                        std::cref(repeat_off[0]),
+                        std::cref(repeat_off[1]),
+                        std::cref(sql_projected),
+                        std::cref(sql_projected_off),
+                        std::cref(sql_q1),
+                        std::cref(sql_q1_off),
+                        std::cref(sql_blk1024),
+                        std::cref(sql_blk1024_off),
+                        std::cref(sql_blk256),
+                        std::cref(sql_blk256_off),
+                        std::cref(sql_blk64),
+                        std::cref(sql_blk64_off),
+                        std::cref(small),
+                        std::cref(small_off),
+                        std::cref(tight),
+                        std::cref(tight_off)}) {
+    WARN("S3 REST perf " << r.get().scenario << " throughput=" << r.get().effective_mib_per_sec
+                         << " MiB/s footer_fetch_ms=" << r.get().footer_fetch_ms
+                         << " chunk_get_ms_mean=" << r.get().chunk_get_ms_mean
+                         << " chunk_get_count=" << r.get().chunk_get_count);
+  }
+
+  append_record(std::move(http));
+  append_record(std::move(https));
+  append_record(std::move(http_cache_off));
+  append_record(std::move(https_cache_off));
+  append_record(std::move(compat_http));
+  append_record(std::move(compat_https));
+  append_record(std::move(gate_off));
+  append_record(std::move(repeat_on[0]));
+  append_record(std::move(repeat_on[1]));
+  append_record(std::move(repeat_off[0]));
+  append_record(std::move(repeat_off[1]));
+  append_record(std::move(sql_projected));
+  append_record(std::move(sql_projected_off));
+  append_record(std::move(sql_q1));
+  append_record(std::move(sql_q1_off));
+  append_record(std::move(sql_blk1024));
+  append_record(std::move(sql_blk1024_off));
+  append_record(std::move(sql_blk256));
+  append_record(std::move(sql_blk256_off));
+  append_record(std::move(sql_blk64));
+  append_record(std::move(sql_blk64_off));
+  append_record(std::move(small));
+  append_record(std::move(small_off));
+  append_record(std::move(tight));
+  append_record(std::move(tight_off));
 
   auto const path = perf_json_path();
   write_perf_json(path,
@@ -1806,7 +2273,32 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
                   sf10_lineitem_key(),
                   static_cast<std::uint64_t>(fs::file_size(large->local_path)),
                   records);
-  require_perf_json_schema(path, {"async_http", "async_https", "compat_http", "compat_https"});
+  require_perf_json_schema(path,
+                           {"rest_reactor_http",
+                            "rest_reactor_https",
+                            "rest_reactor_http_cache_off",
+                            "rest_reactor_https_cache_off",
+                            "rest_reactor_compat_http",
+                            "rest_reactor_compat_https",
+                            "rest_reactor_http_gate_off",
+                            "rest_reactor_projected_repeat_pass1",
+                            "rest_reactor_projected_repeat_pass2",
+                            "rest_reactor_projected_repeat_cache_off_pass1",
+                            "rest_reactor_projected_repeat_cache_off_pass2",
+                            "rest_reactor_sql_projected",
+                            "rest_reactor_sql_projected_cache_off",
+                            "rest_reactor_sql_q1",
+                            "rest_reactor_sql_q1_cache_off",
+                            "rest_reactor_sql_projected_blk1024",
+                            "rest_reactor_sql_projected_blk1024_cache_off",
+                            "rest_reactor_sql_projected_blk256",
+                            "rest_reactor_sql_projected_blk256_cache_off",
+                            "rest_reactor_sql_projected_blk64",
+                            "rest_reactor_sql_projected_blk64_cache_off",
+                            "rest_reactor_small_object",
+                            "rest_reactor_small_object_cache_off",
+                            "rest_reactor_projected_tight_host",
+                            "rest_reactor_projected_tight_host_cache_off"});
   WARN("Wrote S3 REST perf JSON baseline to " << path.string());
 }
 
@@ -1822,7 +2314,11 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
   auto baseline_json     = read_optional_text_file(perf_baseline_path(backend));
 
   std::vector<bench_record> records;
-  records.reserve(4);
+  records.reserve(20);
+  auto append_record = [&](bench_record record) {
+    attach_baseline_comparison(record, baseline_json, backend);
+    records.push_back(std::move(record));
+  };
 
   std::optional<duckdb::idx_t> projected_rows;
   std::optional<duckdb::idx_t> full_rows;
@@ -1835,7 +2331,8 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
                                                  "aws_https_projected",
                                                  bench_single_column_projection(),
                                                  max_connections,
-                                                 projected_rows);
+                                                 projected_rows,
+                                                 /*enable_prefetch_cache=*/true);
     if (!projected_rows.has_value()) { projected_rows = projected.row_count; }
     if (!projected_payload_bytes.has_value()) {
       projected_payload_bytes = projected.payload_bytes_read;
@@ -1845,28 +2342,188 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     CHECK(projected.terminal_failures_total == 0);
     CHECK(projected.device_stream_sync_total == 0);
     WARN("AWS REST projected mc=" << max_connections
-                                  << " throughput=" << projected.effective_bytes_per_sec
-                                  << " B/s footer_fetch_ms=" << projected.footer_fetch_ms
+                                  << " throughput=" << projected.effective_mib_per_sec
+                                  << " MiB/s footer_fetch_ms=" << projected.footer_fetch_ms
                                   << " ttfb_ns=" << projected.ttfb_ns
                                   << " retries=" << projected.retries_total);
-    attach_baseline_comparison(projected, baseline_json, backend);
-    records.push_back(std::move(projected));
+    append_record(std::move(projected));
 
-    auto full = run_rest_aws_bench_scenario(
-      *env, uri, "aws_https_full", bench_full_lineitem_projection(), max_connections, full_rows);
+    auto projected_off = run_rest_aws_bench_scenario(*env,
+                                                     uri,
+                                                     "aws_https_projected_cache_off",
+                                                     bench_single_column_projection(),
+                                                     max_connections,
+                                                     projected_rows,
+                                                     /*enable_prefetch_cache=*/false);
+    CHECK(projected_off.row_count == *projected_rows);
+    CHECK(projected_off.payload_bytes_read == *projected_payload_bytes);
+    CHECK(projected_off.terminal_failures_total == 0);
+    CHECK(projected_off.device_stream_sync_total == 0);
+    append_record(std::move(projected_off));
+
+    auto full = run_rest_aws_bench_scenario(*env,
+                                            uri,
+                                            "aws_https_full",
+                                            bench_full_lineitem_projection(),
+                                            max_connections,
+                                            full_rows,
+                                            /*enable_prefetch_cache=*/true);
     if (!full_rows.has_value()) { full_rows = full.row_count; }
     if (!full_payload_bytes.has_value()) { full_payload_bytes = full.payload_bytes_read; }
     CHECK(full.row_count == *full_rows);
     CHECK(full.payload_bytes_read == *full_payload_bytes);
     CHECK(full.terminal_failures_total == 0);
     CHECK(full.device_stream_sync_total == 0);
-    WARN("AWS REST full mc=" << max_connections << " throughput=" << full.effective_bytes_per_sec
-                             << " B/s footer_fetch_ms=" << full.footer_fetch_ms
+    WARN("AWS REST full mc=" << max_connections << " throughput=" << full.effective_mib_per_sec
+                             << " MiB/s footer_fetch_ms=" << full.footer_fetch_ms
                              << " ttfb_ns=" << full.ttfb_ns << " retries=" << full.retries_total);
-    attach_baseline_comparison(full, baseline_json, backend);
-    records.push_back(std::move(full));
+    append_record(std::move(full));
+
+    auto full_off = run_rest_aws_bench_scenario(*env,
+                                                uri,
+                                                "aws_https_full_cache_off",
+                                                bench_full_lineitem_projection(),
+                                                max_connections,
+                                                full_rows,
+                                                /*enable_prefetch_cache=*/false);
+    CHECK(full_off.row_count == *full_rows);
+    CHECK(full_off.payload_bytes_read == *full_payload_bytes);
+    CHECK(full_off.terminal_failures_total == 0);
+    CHECK(full_off.device_stream_sync_total == 0);
+    append_record(std::move(full_off));
   }
-  REQUIRE(records.size() == 4);
+
+  auto repeat_on  = run_rest_repeat_bench_scenario(*env,
+                                                  uri,
+                                                  "aws_https_projected_repeat_pass1",
+                                                  "aws_https_projected_repeat_pass2",
+                                                  env->endpoint,
+                                                  std::nullopt,
+                                                  true,
+                                                  /*perf_instrumentation=*/true,
+                                                  bench_single_column_projection(),
+                                                  *projected_rows,
+                                                  /*enable_prefetch_cache=*/true,
+                                                  std::string{"presigned"});
+  auto repeat_off = run_rest_repeat_bench_scenario(*env,
+                                                   uri,
+                                                   "aws_https_projected_repeat_cache_off_pass1",
+                                                   "aws_https_projected_repeat_cache_off_pass2",
+                                                   env->endpoint,
+                                                   std::nullopt,
+                                                   true,
+                                                   /*perf_instrumentation=*/true,
+                                                   bench_single_column_projection(),
+                                                   *projected_rows,
+                                                   /*enable_prefetch_cache=*/false,
+                                                   std::string{"presigned"});
+
+  auto const lineitem_scan = "read_parquet(" + sql_quote(uri) + ")";
+  auto const projected_sql = "SELECT sum(l_orderkey) FROM " + lineitem_scan;
+  auto const q1_sql        = tpch_q1_shape_query(lineitem_scan);
+  auto sql_projected       = run_rest_sql_bench_scenario(*env,
+                                                   uri,
+                                                   "aws_sql_projected",
+                                                   projected_sql,
+                                                   env->endpoint,
+                                                   std::nullopt,
+                                                   true,
+                                                   /*enable_prefetch_cache=*/true,
+                                                   std::string{"presigned"});
+  auto sql_projected_off   = run_rest_sql_bench_scenario(*env,
+                                                       uri,
+                                                       "aws_sql_projected_cache_off",
+                                                       projected_sql,
+                                                       env->endpoint,
+                                                       std::nullopt,
+                                                       true,
+                                                       /*enable_prefetch_cache=*/false,
+                                                       std::string{"presigned"});
+  auto sql_q1              = run_rest_sql_bench_scenario(*env,
+                                            uri,
+                                            "aws_sql_q1",
+                                            q1_sql,
+                                            env->endpoint,
+                                            std::nullopt,
+                                            true,
+                                            /*enable_prefetch_cache=*/true,
+                                            std::string{"presigned"});
+  auto sql_q1_off          = run_rest_sql_bench_scenario(*env,
+                                                uri,
+                                                "aws_sql_q1_cache_off",
+                                                q1_sql,
+                                                env->endpoint,
+                                                std::nullopt,
+                                                true,
+                                                /*enable_prefetch_cache=*/false,
+                                                std::string{"presigned"});
+  for (auto const& r : {std::cref(sql_projected),
+                        std::cref(sql_projected_off),
+                        std::cref(sql_q1),
+                        std::cref(sql_q1_off)}) {
+    CHECK(r.get().payload_bytes_read > 0);
+    CHECK(r.get().chunk_get_count > 0);
+    CHECK(r.get().queue_wait_count > 0);
+    CHECK(r.get().terminal_failures_total == 0);
+    CHECK(r.get().device_stream_sync_total == 0);
+  }
+
+  auto const small_uri = aws_bench_small_uri(*env);
+  auto small           = run_rest_uri_bench_scenario(*env,
+                                           small_uri,
+                                           duckdb::idx_t{25},
+                                           "aws_https_small_object",
+                                           env->endpoint,
+                                           std::nullopt,
+                                           true,
+                                           /*perf_instrumentation=*/true,
+                                           std::vector<std::string>{"n_nationkey"},
+                                           std::size_t{32},
+                                           std::size_t{2},
+                                           /*enable_prefetch_cache=*/true,
+                                           std::string{"presigned"});
+  auto small_off       = run_rest_uri_bench_scenario(*env,
+                                               small_uri,
+                                               duckdb::idx_t{25},
+                                               "aws_https_small_object_cache_off",
+                                               env->endpoint,
+                                               std::nullopt,
+                                               true,
+                                               /*perf_instrumentation=*/true,
+                                               std::vector<std::string>{"n_nationkey"},
+                                               std::size_t{32},
+                                               std::size_t{2},
+                                               /*enable_prefetch_cache=*/false,
+                                               std::string{"presigned"});
+  auto tight           = run_rest_aws_bench_scenario(*env,
+                                           uri,
+                                           "aws_https_full_tight_host",
+                                           bench_full_lineitem_projection(),
+                                           std::size_t{32},
+                                           full_rows,
+                                           /*enable_prefetch_cache=*/true,
+                                           std::string{"8 GiB"});
+  auto tight_off       = run_rest_aws_bench_scenario(*env,
+                                               uri,
+                                               "aws_https_full_tight_host_cache_off",
+                                               bench_full_lineitem_projection(),
+                                               std::size_t{32},
+                                               full_rows,
+                                               /*enable_prefetch_cache=*/false,
+                                               std::string{"8 GiB"});
+
+  append_record(std::move(repeat_on[0]));
+  append_record(std::move(repeat_on[1]));
+  append_record(std::move(repeat_off[0]));
+  append_record(std::move(repeat_off[1]));
+  append_record(std::move(sql_projected));
+  append_record(std::move(sql_projected_off));
+  append_record(std::move(sql_q1));
+  append_record(std::move(sql_q1_off));
+  append_record(std::move(small));
+  append_record(std::move(small_off));
+  append_record(std::move(tight));
+  append_record(std::move(tight_off));
 
   auto dataset_bytes = std::uint64_t{0};
   for (auto const& record : records) {
@@ -1876,7 +2533,23 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
 
   auto const path = perf_json_path();
   write_perf_json(path, *env, backend, object_key, dataset_bytes, records);
-  require_perf_json_schema(path, {"aws_https_projected", "aws_https_full"});
+  require_perf_json_schema(path,
+                           {"aws_https_projected",
+                            "aws_https_projected_cache_off",
+                            "aws_https_full",
+                            "aws_https_full_cache_off",
+                            "aws_https_projected_repeat_pass1",
+                            "aws_https_projected_repeat_pass2",
+                            "aws_https_projected_repeat_cache_off_pass1",
+                            "aws_https_projected_repeat_cache_off_pass2",
+                            "aws_sql_projected",
+                            "aws_sql_projected_cache_off",
+                            "aws_sql_q1",
+                            "aws_sql_q1_cache_off",
+                            "aws_https_small_object",
+                            "aws_https_small_object_cache_off",
+                            "aws_https_full_tight_host",
+                            "aws_https_full_tight_host_cache_off"});
   append_perf_history_jsonl(
     perf_history_path(backend), *env, backend, object_key, dataset_bytes, records);
   WARN("Wrote AWS S3 REST perf JSON to " << path.string());

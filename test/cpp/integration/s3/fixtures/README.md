@@ -24,6 +24,12 @@ SIRIUS_TEST_S3_STRICT=1` for the default MinIO backend, so MinIO is
 auto-managed, the SF10 fixture is prepared in-process, and any bring-up failure
 is loud — no separate fixture/up step.
 
+The JSON baseline uses `rest_reactor_*` scenario names for the current REST
+reactor path. `rest_reactor_compat_*` scenarios keep the older seven-column,
+`max_connections=32` shape for historical comparison. Each result reports both
+`effective_bytes_per_sec` and `effective_mib_per_sec`; prefer the MiB/s field in
+human-facing summaries.
+
 AWS portability uses the same benchmark test with the MinIO auto-path off:
 
 ```sh
