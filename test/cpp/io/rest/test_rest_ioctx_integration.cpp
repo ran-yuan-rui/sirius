@@ -145,7 +145,8 @@ scan_manager_config make_tls_minio_rest_config()
   return cfg;
 }
 
-scan_manager_config make_fake_rest_config(std::string endpoint)
+scan_manager_config make_fake_rest_config(
+  std::string endpoint, std::shared_ptr<sirius::io::io_telemetry_sink> io_telemetry = nullptr)
 {
   scan_manager_config cfg{};
   cfg.use_sirius_datasource        = true;
@@ -163,6 +164,7 @@ scan_manager_config make_fake_rest_config(std::string endpoint)
   cfg.rest.honor_retry_after       = false;
   cfg.rest_n_reactors              = 1;
   cfg.enable_prefetch_cache        = false;
+  cfg.io_telemetry                 = std::move(io_telemetry);
   return cfg;
 }
 
@@ -694,6 +696,23 @@ bool read_ids_are_unique(std::vector<sirius::io::logical_io_record> const& recor
     }
   }
   return true;
+}
+
+io_telemetry_records wait_for_backend_phase(recording_io_telemetry_sink const& recorder,
+                                            io_telemetry_cursor cursor,
+                                            sirius::io::io_phase phase)
+{
+  auto const deadline = std::chrono::steady_clock::now() + 5s;
+  do {
+    auto records = recorder.records_since(cursor);
+    if (std::any_of(records.backend.begin(), records.backend.end(), [&](auto const& record) {
+          return record.attribution.phase == phase;
+        })) {
+      return records;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  return recorder.records_since(cursor);
 }
 
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_telemetry_nation_table_info(
@@ -2065,11 +2084,12 @@ TEST_CASE("IO telemetry keeps sequential S3 query attribution isolated",
   if (!sirius::test::ensure_s3_container_env()) { return; }
 
   auto recorder = std::make_shared<recording_io_telemetry_sink>();
-  io_telemetry_sql_fixture fixture(recorder, /*enable_prefetch_cache=*/false);
+  io_telemetry_sql_fixture fixture(recorder, /*enable_prefetch_cache=*/true);
 
   auto const before_first = recorder->cursor();
   fixture.run("n_nationkey");
-  auto const first = recorder->records_since(before_first);
+  auto const first =
+    wait_for_backend_phase(*recorder, before_first, sirius::io::io_phase::prefetch);
   REQUIRE_FALSE(first.logical.empty());
   auto const first_queries = distinct_query_ids(first);
   REQUIRE(first_queries.size() == 1);
@@ -2083,6 +2103,7 @@ TEST_CASE("IO telemetry keeps sequential S3 query attribution isolated",
   CHECK(first_queries.front() != second_queries.front());
 
   bool saw_foreground_device = false;
+  bool saw_prefetch_device   = false;
   auto check_attribution     = [&](io_telemetry_records const& records,
                                sirius::io::io_uuid expected_query) {
     for (auto const& record : records.logical) {
@@ -2093,15 +2114,16 @@ TEST_CASE("IO telemetry keeps sequential S3 query attribution isolated",
       if (record.attribution.device_id >= 0) { saw_foreground_device = true; }
     }
     for (auto const& record : records.backend) {
-      CHECK(record.attribution.phase != sirius::io::io_phase::prefetch);
-      if (record.attribution.phase != sirius::io::io_phase::scan) { continue; }
+      if (record.attribution.phase != sirius::io::io_phase::prefetch) { continue; }
       CHECK(record.attribution.query_uuid == expected_query);
       CHECK_FALSE(record.attribution.pipeline_uuid.is_nil());
+      if (record.attribution.device_id >= 0) { saw_prefetch_device = true; }
     }
   };
   check_attribution(first, first_queries.front());
   check_attribution(second, second_queries.front());
   CHECK(saw_foreground_device);
+  CHECK(saw_prefetch_device);
 }
 
 TEST_CASE("IO telemetry attributes dispatcher footer reads before device assignment",
@@ -2146,6 +2168,75 @@ TEST_CASE("IO telemetry attributes dispatcher footer reads before device assignm
     CHECK(has_backend_record(records, record.read_id));
   }
   CHECK(footer_reads > 0);
+}
+
+TEST_CASE("IO telemetry carries split attribution into background prefetch reads",
+          "[.][s3][integration][io_telemetry][prefetch]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto recorder = std::make_shared<recording_io_telemetry_sink>();
+  io_telemetry_sql_fixture fixture(recorder, /*enable_prefetch_cache=*/true);
+  auto const before = recorder->cursor();
+  fixture.run("n_nationkey");
+  auto const records = wait_for_backend_phase(*recorder, before, sirius::io::io_phase::prefetch);
+
+  auto const prefetch =
+    std::find_if(records.backend.begin(), records.backend.end(), [](auto const& r) {
+      return r.attribution.phase == sirius::io::io_phase::prefetch;
+    });
+  REQUIRE(prefetch != records.backend.end());
+  CHECK_FALSE(prefetch->read_id.is_nil());
+  CHECK_FALSE(prefetch->attribution.query_uuid.is_nil());
+  CHECK_FALSE(prefetch->attribution.pipeline_uuid.is_nil());
+  CHECK(prefetch->attribution.device_id >= 0);
+  CHECK(prefetch->terminal == sirius::io::io_terminal_class::ok);
+}
+
+TEST_CASE("IO telemetry joins a cold cache miss to its REST backend read",
+          "[.][s3][integration][io_telemetry][cache]")
+{
+  auto payload  = deterministic_payload(16 * 1024);
+  auto recorder = std::make_shared<recording_io_telemetry_sink>();
+  range_http_server server(payload);
+  scan_manager_fixture fixture;
+  auto cfg                  = make_fake_rest_config(server.endpoint(), recorder);
+  cfg.enable_prefetch_cache = true;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto datasource = manager.create_datasource("s3://telemetry-bucket/cold-cache.bin");
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx()->cache() != nullptr);
+  auto const before = recorder->cursor();
+
+  std::array<std::uint8_t, 128> got{};
+  REQUIRE(datasource->host_read(37, got.size(), got.data()) == got.size());
+  require_bytes_equal(got, std::span<std::uint8_t const>(payload.data() + 37, got.size()));
+
+  auto const records = recorder->records_since(before);
+  require_source_neutral_success(records, got.size());
+  CHECK(records.logical.front().route == sirius::io::io_route::cache);
+  CHECK(has_backend_record(records, records.logical.front().read_id));
+}
+
+TEST_CASE("IO telemetry identifies a fully prefetched reread without backend IO",
+          "[.][s3][integration][io_telemetry][cache]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto recorder = std::make_shared<recording_io_telemetry_sink>();
+  io_telemetry_sql_fixture fixture(recorder, /*enable_prefetch_cache=*/true);
+  fixture.run("n_nationkey");
+
+  auto const before = recorder->cursor();
+  fixture.run("n_nationkey");
+  auto const records = recorder->records_since(before);
+
+  auto const cache_hit =
+    std::find_if(records.logical.begin(), records.logical.end(), [&](auto const& r) {
+      return r.route == sirius::io::io_route::cache && r.outcome == sirius::io::io_outcome::ok &&
+             !has_backend_record(records, r.read_id);
+    });
+  REQUIRE(cache_hit != records.logical.end());
 }
 
 TEST_CASE("IO telemetry off mode leaves a REST ioctx inert",
