@@ -96,7 +96,12 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
     SIRIUS_LOG_DEBUG("[coalesce-debug] load_balancer emit pipeline={} -> preferred GPU {}",
                      state.pipeline_id,
                      dev_id.has_value() ? dev_id.value() : -1);
-    if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
+    if (dev_id.has_value() && *dev_id >= 0) {
+      op_data->set_preferred_device_id(dev_id.value());
+      // Patch the routed device onto every slice datasource BEFORE prefetch
+      // arming so both foreground and prefetch-cache reads carry it.
+      op_data->set_io_device(dev_id.value());
+    }
 
     auto fadvise_hints = op_data->get_fadvise_hints();
     if (!fadvise_hints.empty()) {

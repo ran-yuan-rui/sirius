@@ -193,7 +193,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   const pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size())};
+    static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size()),
+    query_handle_->uuid()};
 
   // The RESULT_COLLECTOR wrap is added after the plan generator's own `set_parent_ops` ran;
   // re-walk so the wrapped child's `_parent_op` points at RESULT_COLLECTOR (the tree-parent

@@ -282,7 +282,7 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
-  auto datasource = create_datasource(uri, hint);
+  auto datasource = create_datasource(uri, hint, sirius::io::io_phase::bind);
   if (!datasource) {
     throw std::runtime_error("[sirius_scan_manager::describe_parquet] no backend supports URI: " +
                              uri);
@@ -354,6 +354,19 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
+    // Stamp query/pipeline attribution on the ingestible BEFORE any metadata
+    // task can be scheduled, so the dispatcher-thread footer reads it issues
+    // are already attributed (device is refined at split emission).
+    if (auto pipeline = op->get_pipeline()) {
+      const auto query_uuid    = pipeline->query_uuid();
+      const auto pipeline_uuid = pipeline->pipeline_uuid();
+      op->get_ingestible().set_io_attribution(io::io_attribution{
+        .query_uuid    = {query_uuid.high_bits, query_uuid.low_bits},
+        .pipeline_uuid = {pipeline_uuid.high_bits, pipeline_uuid.low_bits},
+        .device_id     = -1,
+        .phase         = io::io_phase::scan,
+      });
+    }
     _metadata_processor->register_pipeline(op, round_robin);
     // On a pinned-cache hit the coalescer serves this operator from the cached
     // batch_provider (process_cached_entries); skip the disk-reading
@@ -396,14 +409,20 @@ void sirius_scan_manager::start_metadata_processing()
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path, sirius::io::open_hint hint)
+  std::string_view path, sirius::io::open_hint hint, sirius::io::io_phase phase)
 {
   auto file_path = normalize_path(std::string(path));
   auto io_ctx    = ioctx_for_path(file_path);
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
-  return io_ctx->open_datasource(file_path, hint);
+  auto datasource = io_ctx->open_datasource(file_path, hint);
+  // Phase-only attribution: callers on identity-free paths (bind/describe)
+  // tag their reads; the default leaves the datasource unattributed.
+  if (datasource && phase != sirius::io::io_phase::unknown) {
+    datasource->set_io_attribution(io::io_attribution{.phase = phase});
+  }
+  return datasource;
 }
 
 void sirius_scan_manager::list_objects_paged(

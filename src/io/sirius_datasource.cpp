@@ -266,7 +266,9 @@ std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
   // deliberately reused across splits of the same file.  The new
   // datasource starts with a default-constructed prefetching_handle so
   // its fadvise() calls can't accidentally cancel the original's work.
-  return std::make_unique<sirius_datasource>(_io_ctx, _io_object);
+  auto dup          = std::make_unique<sirius_datasource>(_io_ctx, _io_object);
+  dup->_attribution = _attribution;
+  return dup;
 }
 
 void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,

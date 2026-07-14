@@ -128,6 +128,11 @@ class duckdb_native_scan_info : public op::scan::scan_info {
     return {std::move(entry)};
   }
 
+  void set_io_device(int device_id) override
+  {
+    if (datasource) { datasource->set_io_device(device_id); }
+  }
+
   /// Decoded (GPU) byte budget for this unit; drives memory reservation.
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {

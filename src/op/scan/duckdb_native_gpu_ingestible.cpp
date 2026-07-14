@@ -301,9 +301,10 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                std::to_string(rg_begin) + ", " + std::to_string(rg_end) +
                                ")): " + range.viability_failure_reason);
     }
-    auto split           = std::make_unique<duckdb_native_scan_info>();
-    split->row_groups    = std::move(range.row_groups);
-    split->datasource    = io_ctx->open_datasource(_info->db_path);
+    auto split        = std::make_unique<duckdb_native_scan_info>();
+    split->row_groups = std::move(range.row_groups);
+    split->datasource = io_ctx->open_datasource(_info->db_path);
+    if (split->datasource) { split->datasource->set_io_attribution(io_attribution()); }
     split->block_manager = _block_manager;
     return split;
   };

@@ -193,6 +193,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
 
+  //! The owning query's UUID from the build context (nil when the pipeline was
+  //! built without an engine). Consumed by scan-time IO attribution.
+  [[nodiscard]] uuid::UUID query_uuid() const { return build_ctx_.query_uuid(); }
+
   //! The SiriusContext-wide telemetry context carried in this pipeline's build
   //! context (set at convert time in sirius_engine). Operators read it via
   //! sirius_physical_operator::get_telemetry_context() to build data_batch probes.

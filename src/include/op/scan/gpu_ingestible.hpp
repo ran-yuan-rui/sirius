@@ -149,8 +149,24 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   /// @ref post_filter_and_project resolves the same columns on both paths.
   [[nodiscard]] virtual std::vector<std::size_t> materialized_column_order() const = 0;
 
+  /// IO attribution stamped by the scan manager at query preparation, BEFORE
+  /// any metadata task can run — every datasource this ingestible opens
+  /// inherits it (device_id is refined later at split emission). Not
+  /// synchronized: write happens strictly before the metadata tasks that read
+  /// it are scheduled.
+  void set_io_attribution(const io::io_attribution& attribution) noexcept
+  {
+    _io_attribution = attribution;
+  }
+  [[nodiscard]] const io::io_attribution& io_attribution() const noexcept
+  {
+    return _io_attribution;
+  }
+
  protected:
   gpu_ingestible() noexcept = default;
+
+  io::io_attribution _io_attribution{};
 };
 
 }  // namespace scan

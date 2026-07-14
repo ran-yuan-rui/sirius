@@ -157,6 +157,13 @@ class parquet_split_info : public scan_info {
   /// the reader_options column projection). Drives prefetch for the materialize
   /// read across every file in the batch.
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
+
+  void set_io_device(int device_id) override
+  {
+    for (auto& s : rg_slices) {
+      if (s.datasource) { s.datasource->set_io_device(device_id); }
+    }
+  }
 };
 
 //===----------------------------------------------------------------------===//

@@ -238,7 +238,8 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   // the returned sirius_datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
   // DuckDB to surface at bind time.
-  auto datasource = sirius_ctx->get_scan_manager().create_datasource(path);
+  auto datasource = sirius_ctx->get_scan_manager().create_datasource(
+    path, sirius::io::open_hint::generic, sirius::io::io_phase::bind);
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + path + "'");
   }

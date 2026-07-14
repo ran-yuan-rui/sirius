@@ -451,6 +451,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
+  if (sirius_ds) { sirius_ds->set_io_attribution(io_attribution()); }
 
   // Local copy of the shared options; the per-file filter pushdown decision is
   // applied here, never on _reader_options.

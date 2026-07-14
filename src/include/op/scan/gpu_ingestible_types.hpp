@@ -85,6 +85,11 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
 
+  /// Patch the routed device id onto every datasource this split will read
+  /// through. Called once at split emission (device selected, before any
+  /// prefetch arming or read). Default: no datasources to patch.
+  virtual void set_io_device(int /*device_id*/) {}
+
   /**
    * @brief Estimated decoded bytes for projected data columns before row filtering.
    *
