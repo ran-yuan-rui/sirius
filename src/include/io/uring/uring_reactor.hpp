@@ -19,6 +19,7 @@
 #include "exec/semi_future.hpp"
 #include "io/cache/types.hpp"
 #include "io/details/slot_pool.hpp"
+#include "io/io_telemetry.hpp"
 #include "io/types.hpp"
 #include "io/uring/config.hpp"
 #include "io/uring/types.hpp"
@@ -138,8 +139,10 @@ class uring_reactor {
   /// shared submission/poll thread, etc.).  Carries the primitive @c config too.
   class reactor_context {
    public:
-    reactor_context(config cfg, cucascade::memory::fixed_size_host_memory_resource* mr)
-      : _config(cfg), _mr(mr)
+    reactor_context(config cfg,
+                    cucascade::memory::fixed_size_host_memory_resource* mr,
+                    std::shared_ptr<io_telemetry_sink> io_telemetry = nullptr)
+      : _config(cfg), _mr(mr), _io_telemetry(std::move(io_telemetry))
     {
     }
 
@@ -149,10 +152,15 @@ class uring_reactor {
     {
       return _mr;
     }
+    [[nodiscard]] const std::shared_ptr<io_telemetry_sink>& io_telemetry() const noexcept
+    {
+      return _io_telemetry;
+    }
 
    private:
     config _config;
     cucascade::memory::fixed_size_host_memory_resource* _mr{nullptr};
+    std::shared_ptr<io_telemetry_sink> _io_telemetry;
   };
 
   using native_handle_type        = int;
@@ -225,8 +233,11 @@ class uring_reactor {
   void shutdown();
 
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
-  size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
-
+  size_t host_read(const io_object_type& file,
+                   size_t offset,
+                   size_t size,
+                   uint8_t* dst,
+                   const io_read_context* telemetry_ctx = nullptr);
   void enqueue(request_type_ptr req);
 
   /// Whether @p path can be served by this reactor.  Local-disk only:
