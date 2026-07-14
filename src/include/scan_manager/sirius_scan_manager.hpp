@@ -328,7 +328,9 @@ class sirius_scan_manager {
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
+    std::string_view path,
+    sirius::io::open_hint hint = sirius::io::open_hint::generic,
+    sirius::io::io_phase phase = sirius::io::io_phase::unknown);
 
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.

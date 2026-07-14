@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "telemetry-bridge/gen/uuid.rs.h"
+
 #include <memory>
 #include <utility>
 
@@ -42,13 +44,18 @@ class pipeline_build_context {
   //!        Enables sirius_pipeline_converter::configure_partition_min_partitions
   //!        to ensure big partition-consuming operators (hash_join,
   //!        merge_group_by) get at least num_gpus partitions to spread work.
+  //! @param query_uuid The owning query's UUID (nil when pipelines are built
+  //!        without an engine — tests, optimizer/bind). Carried into each
+  //!        sirius_pipeline so scan-time IO can be attributed to the query.
   explicit pipeline_build_context(
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
     bool preserve_insertion_order = true,
-    int num_gpus                  = 1)
+    int num_gpus                  = 1,
+    uuid::UUID query_uuid         = uuid::UUID{})
     : _telemetry_context(std::move(telemetry_context)),
       _preserve_insertion_order(preserve_insertion_order),
-      _num_gpus(num_gpus)
+      _num_gpus(num_gpus),
+      _query_uuid(query_uuid)
   {
   }
 
@@ -61,10 +68,13 @@ class pipeline_build_context {
     return _telemetry_context;
   }
 
+  [[nodiscard]] uuid::UUID query_uuid() const { return _query_uuid; }
+
  private:
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   bool _preserve_insertion_order = true;
   int _num_gpus                  = 1;
+  uuid::UUID _query_uuid{};
 };
 
 }  // namespace pipeline

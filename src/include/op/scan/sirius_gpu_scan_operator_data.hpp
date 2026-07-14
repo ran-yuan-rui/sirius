@@ -84,6 +84,12 @@ class scan_operator_input : public op::operator_data {
     return std::get<std::unique_ptr<scan_info>>(materialization_info)->fadvise_entries();
   }
 
+  void set_io_device(int device_id) const
+  {
+    if (!has_scan_metadata()) { return; }
+    std::get<std::unique_ptr<scan_info>>(materialization_info)->set_io_device(device_id);
+  }
+
   void prefetch(io::cache::prefetching_stage site) const
   {
     if (!has_scan_metadata()) { return; }
