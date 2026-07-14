@@ -325,7 +325,8 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
 
 prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
                                              std::span<const byte_range> ranges,
-                                             std::optional<int> gpu_id)
+                                             std::optional<int> gpu_id,
+                                             const io_attribution* attribution)
 {
   if (!_armed) { return prefetching_handle(nullptr); }
 
@@ -357,6 +358,10 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
 
   auto work    = std::make_shared<prefetch_request_context>(obj, _ticker.load());
   work->chunks = std::move(chunks_to_fetch);
+  if (attribution != nullptr) {
+    work->attribution       = *attribution;
+    work->attribution.phase = io_phase::prefetch;
+  }
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
   if (gpu_id && _topology_index) { work->preferred_numa = _topology_index->numa_node_of(*gpu_id); }
@@ -419,38 +424,43 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
   return false;
 }
 
-exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_io_object& obj,
-                                                                  size_t offset,
-                                                                  size_t size,
-                                                                  uint8_t* dst,
-                                                                  prefetching_handle* out_handle)
+exec::semi_future<std::size_t> prefetching_cache::host_read_async(
+  const sirius_io_object& obj,
+  size_t offset,
+  size_t size,
+  uint8_t* dst,
+  prefetching_handle* out_handle,
+  const io_read_context* telemetry_ctx)
 {
   bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
   if (status) { return exec::make_semi_future<std::size_t>(size); }
   size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
   _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
-  return _io_ctx->host_read_async_io(obj, offset, size, dst);
+  return _io_ctx->host_read_async_io(obj, offset, size, dst, telemetry_ctx);
 }
 
 std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
                                          size_t offset,
                                          size_t size,
                                          uint8_t* dst,
-                                         prefetching_handle* out_handle)
+                                         prefetching_handle* out_handle,
+                                         const io_read_context* telemetry_ctx)
 {
   bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
   if (status) { return size; }
   size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
   _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
-  return _io_ctx->host_read_io(obj, offset, size, dst);
+  return _io_ctx->host_read_io(obj, offset, size, dst, telemetry_ctx);
 }
 
-exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius_io_object& obj,
-                                                                    size_t offset,
-                                                                    size_t size,
-                                                                    uint8_t* dst,
-                                                                    rmm::cuda_stream_view stream,
-                                                                    prefetching_handle* out_handle)
+exec::semi_future<std::size_t> prefetching_cache::device_read_async(
+  const sirius_io_object& obj,
+  size_t offset,
+  size_t size,
+  uint8_t* dst,
+  rmm::cuda_stream_view stream,
+  prefetching_handle* out_handle,
+  const io_read_context* telemetry_ctx)
 {
   if (size == 0 || dst == nullptr) { return std::size_t{0}; }
 
@@ -582,9 +592,10 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
     // synthesize a ready future so both paths share one continuation; stream.synchronize()
     // is equivalent to the previous event.synchronize() since only case-(1) copies are
     // on the stream at that point.
-    auto io_fut = io_segments.empty() ? exec::make_semi_future<size_t>(size)
-                                      : _io_ctx->host_to_device_read_async_io(
-                                          obj, io_segments, offset, size, dst, stream);
+    auto io_fut = io_segments.empty()
+                    ? exec::make_semi_future<size_t>(size)
+                    : _io_ctx->host_to_device_read_async_io(
+                        obj, io_segments, offset, size, dst, stream, telemetry_ctx);
     return std::move(io_fut)
       .via(exec::inline_executor::instance())
       .then_try([this,
@@ -624,7 +635,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
       .semi();
   }
   _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
-  return _io_ctx->device_read_async_io(obj, offset, size, dst, stream);
+  return _io_ctx->device_read_async_io(obj, offset, size, dst, stream, telemetry_ctx);
 }
 
 std::string prefetching_cache::summary() const
@@ -779,7 +790,14 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
       continue;
     }
 
-    _io_ctx->host_read_ranges_async_io(*io_obj, segments)
+    io_read_context telemetry_rctx;
+    const io_read_context* telemetry_ptr = nullptr;
+    if (_io_ctx->io_telemetry() != nullptr) {
+      telemetry_rctx =
+        io_read_context{req->attribution, make_io_read_id(), io_obj->telemetry_object_id()};
+      telemetry_ptr = &telemetry_rctx;
+    }
+    _io_ctx->host_read_ranges_async_io(*io_obj, segments, telemetry_ptr)
       .via(&_io_cb_dispatcher)
       .then_try([req, chunks = std::move(allocated_chunks), _ = std::move(token)](
                   exec::try_t<size_t>&& res) mutable {

@@ -23,6 +23,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/cache/config.hpp"
 #include "io/cache/types.hpp"
+#include "io/io_telemetry.hpp"
 #include "planner/query.hpp"
 
 #include <concurrentqueue.h>
@@ -68,6 +69,10 @@ struct prefetch_request_context {
     return user_state &&
            user_state->load(std::memory_order_acquire) == prefetching_handle_state::active;
   }
+
+  /// Attribution of the scan that armed this prefetch (phase rewritten to
+  /// @c prefetch); nil when no telemetry sink was active at insert time.
+  io_attribution attribution{};
 
   [[nodiscard]] bool is_cancelled() const noexcept
   {
@@ -154,14 +159,16 @@ class prefetching_cache {
                                       size_t offset,
                                       size_t size,
                                       uint8_t* dst,
-                                      prefetching_handle* out_handle = nullptr);
+                                      prefetching_handle* out_handle       = nullptr,
+                                      const io_read_context* telemetry_ctx = nullptr);
 
   [[nodiscard]] exec::semi_future<std::size_t> host_read_async(
     const sirius_io_object& obj,
     size_t offset,
     size_t size,
     uint8_t* dst,
-    prefetching_handle* out_handle = nullptr);
+    prefetching_handle* out_handle       = nullptr,
+    const io_read_context* telemetry_ctx = nullptr);
 
   [[nodiscard]] exec::semi_future<std::size_t> device_read_async(
     const sirius_io_object& obj,
@@ -169,7 +176,8 @@ class prefetching_cache {
     size_t size,
     uint8_t* device_ptr,
     rmm::cuda_stream_view stream,
-    prefetching_handle* out_handle = nullptr);
+    prefetching_handle* out_handle       = nullptr,
+    const io_read_context* telemetry_ctx = nullptr);
 
   [[nodiscard]] std::string summary() const;
 
@@ -183,7 +191,8 @@ class prefetching_cache {
  private:
   [[nodiscard]] prefetching_handle insert(const sirius_io_object& obj,
                                           std::span<const byte_range> ranges,
-                                          std::optional<int> gpu_id = {});
+                                          std::optional<int> gpu_id         = {},
+                                          const io_attribution* attribution = nullptr);
 
   [[nodiscard]] bool host_read_from_cache_only(const sirius_io_object& obj,
                                                size_t offset,
