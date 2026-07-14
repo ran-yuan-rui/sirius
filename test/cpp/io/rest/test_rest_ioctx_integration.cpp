@@ -22,8 +22,12 @@
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius_config.hpp"
+#include "sirius_context.hpp"
+#include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -35,6 +39,7 @@
 #include <arpa/inet.h>
 #include <config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <duckdb.hpp>
 #include <log/logging.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -904,6 +909,24 @@ void require_source_neutral_success(io_telemetry_records const& records,
   CHECK(backend.t_create_ns <= backend.t_complete_ns);
 }
 
+std::vector<sirius::io::io_uuid> distinct_query_ids(io_telemetry_records const& records)
+{
+  std::vector<sirius::io::io_uuid> ids;
+  auto append = [&](sirius::io::io_attribution const& attribution) {
+    if (attribution.query_uuid.is_nil()) { return; }
+    if (std::find(ids.begin(), ids.end(), attribution.query_uuid) == ids.end()) {
+      ids.push_back(attribution.query_uuid);
+    }
+  };
+  for (auto const& record : records.logical) {
+    append(record.attribution);
+  }
+  for (auto const& record : records.backend) {
+    append(record.attribution);
+  }
+  return ids;
+}
+
 bool read_ids_are_unique(std::vector<sirius::io::logical_io_record> const& records)
 {
   for (std::size_t i = 0; i < records.size(); ++i) {
@@ -914,6 +937,129 @@ bool read_ids_are_unique(std::vector<sirius::io::logical_io_record> const& recor
   }
   return true;
 }
+
+std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_telemetry_nation_table_info(
+  std::string uri)
+{
+  auto info                 = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths = {std::move(uri)};
+  info->names               = {"n_nationkey", "n_name", "n_regionkey", "n_comment"};
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::VARCHAR));
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::VARCHAR));
+  for (duckdb::idx_t i = 0; i < info->returned_types.size(); ++i) {
+    info->column_ids.push_back(duckdb::ColumnIndex(i));
+  }
+  info->scan_output_arity = info->returned_types.size();
+  return info;
+}
+
+void load_static_sirius_extension(duckdb::DuckDB& db)
+{
+  try {
+    db.LoadStaticExtension<duckdb::SiriusExtension>();
+  } catch (std::exception const& e) {
+    auto const message = std::string{e.what()};
+    if (message.find("already exists") == std::string::npos &&
+        message.find("already loaded") == std::string::npos) {
+      throw;
+    }
+  }
+}
+
+std::string gpu_execution_query(std::string_view inner_sql)
+{
+  std::string escaped;
+  escaped.reserve(inner_sql.size() + 8);
+  for (char c : inner_sql) {
+    if (c == '\'') { escaped.push_back('\''); }
+    escaped.push_back(c);
+  }
+  return "SELECT * FROM gpu_execution('" + escaped + "')";
+}
+
+class scoped_environment_value {
+ public:
+  scoped_environment_value(std::string name, std::string value) : _name(std::move(name))
+  {
+    if (auto* current = std::getenv(_name.c_str()); current != nullptr) {
+      _old_value = current;
+      _had_value = true;
+    }
+    setenv(_name.c_str(), value.c_str(), 1);
+  }
+
+  ~scoped_environment_value()
+  {
+    if (_had_value) {
+      setenv(_name.c_str(), _old_value.c_str(), 1);
+    } else {
+      unsetenv(_name.c_str());
+    }
+  }
+
+  scoped_environment_value(scoped_environment_value const&)            = delete;
+  scoped_environment_value& operator=(scoped_environment_value const&) = delete;
+
+ private:
+  std::string _name;
+  std::string _old_value;
+  bool _had_value{false};
+};
+
+class io_telemetry_sql_fixture {
+ public:
+  io_telemetry_sql_fixture(std::shared_ptr<recording_io_telemetry_sink> recorder,
+                           bool enable_prefetch_cache)
+    : _disable_autoload("SIRIUS_DISABLE", "1"), _recorder(std::move(recorder))
+  {
+    _db  = std::make_unique<duckdb::DuckDB>(nullptr);
+    _con = std::make_unique<duckdb::Connection>(*_db);
+    load_static_sirius_extension(*_db);
+
+    sirius::sirius_config config;
+    config.load_from_file(project_root() / "test/cpp/integration/integration_s3cache.yaml");
+    auto scan_cfg                           = make_minio_rest_config(_recorder);
+    scan_cfg.enable_prefetch_cache          = enable_prefetch_cache;
+    scan_cfg.cache.inflight_io_chunk_budget = 16;
+    config.set_scan_manager_config(std::move(scan_cfg));
+
+    _context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
+    _context->initialize(config);
+    _con->context->registered_state->Remove("sirius_state");
+    _con->context->registered_state->Insert("sirius_state", _context);
+
+    _uri = "s3://" + require_env("SIRIUS_TEST_S3_BUCKET") + "/parquet/nation.parquet";
+  }
+
+  ~io_telemetry_sql_fixture()
+  {
+    if (_con) { _con->context->registered_state->Remove("sirius_state"); }
+    _con.reset();
+    if (_context) { _context->terminate(); }
+    _context.reset();
+    _db.reset();
+  }
+
+  void run(std::string const& projection)
+  {
+    auto const sql = "SELECT " + projection + " FROM read_parquet('" + _uri + "')";
+    auto result    = _con->Query(gpu_execution_query(sql));
+    REQUIRE(result != nullptr);
+    INFO((result->HasError() ? result->GetError() : ""));
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->RowCount() == 25);
+  }
+
+ private:
+  scoped_environment_value _disable_autoload;
+  std::shared_ptr<recording_io_telemetry_sink> _recorder;
+  std::unique_ptr<duckdb::DuckDB> _db;
+  std::unique_ptr<duckdb::Connection> _con;
+  duckdb::shared_ptr<duckdb::SiriusContext> _context;
+  std::string _uri;
+};
 
 struct list_watchdog_result {
   bool timed_out{false};
@@ -2801,6 +2947,99 @@ TEST_CASE("IO telemetry counts each public datasource overload once",
   }
 
   require_source_neutral_success(recorder->records_since(before), bytes);
+}
+
+TEST_CASE("IO telemetry keeps sequential S3 query attribution isolated",
+          "[.][s3][integration][io_telemetry][attribution]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto recorder = std::make_shared<recording_io_telemetry_sink>();
+  io_telemetry_sql_fixture fixture(recorder, /*enable_prefetch_cache=*/false);
+
+  auto const before_first = recorder->cursor();
+  fixture.run("n_nationkey");
+  auto const first = recorder->records_since(before_first);
+  REQUIRE_FALSE(first.logical.empty());
+  auto const first_queries = distinct_query_ids(first);
+  REQUIRE(first_queries.size() == 1);
+
+  auto const before_second = recorder->cursor();
+  fixture.run("n_name");
+  auto const second = recorder->records_since(before_second);
+  REQUIRE_FALSE(second.logical.empty());
+  auto const second_queries = distinct_query_ids(second);
+  REQUIRE(second_queries.size() == 1);
+  CHECK(first_queries.front() != second_queries.front());
+
+  bool saw_foreground_device = false;
+  auto check_attribution     = [&](io_telemetry_records const& records,
+                               sirius::io::io_uuid expected_query) {
+    for (auto const& record : records.logical) {
+      CHECK(record.attribution.phase != sirius::io::io_phase::prefetch);
+      if (record.attribution.phase != sirius::io::io_phase::scan) { continue; }
+      CHECK(record.attribution.query_uuid == expected_query);
+      CHECK_FALSE(record.attribution.pipeline_uuid.is_nil());
+      if (record.attribution.device_id >= 0) { saw_foreground_device = true; }
+    }
+    for (auto const& record : records.backend) {
+      CHECK(record.attribution.phase != sirius::io::io_phase::prefetch);
+      if (record.attribution.phase != sirius::io::io_phase::scan) { continue; }
+      CHECK(record.attribution.query_uuid == expected_query);
+      CHECK_FALSE(record.attribution.pipeline_uuid.is_nil());
+    }
+  };
+  check_attribution(first, first_queries.front());
+  check_attribution(second, second_queries.front());
+  CHECK(saw_foreground_device);
+}
+
+TEST_CASE("IO telemetry records dispatcher footer reads as attributed logical stash hits",
+          "[.][s3][integration][io_telemetry][footer]")
+{
+  auto payload  = read_binary_file(committed_parquet_fixture("nation.parquet"));
+  auto recorder = std::make_shared<recording_io_telemetry_sink>();
+  range_http_server server(std::move(payload));
+  auto ioctx = make_direct_rest_ioctx(server.endpoint(), direct_rest_test_config(), recorder);
+
+  std::string const uri = "s3://telemetry-bucket/nation.parquet";
+  auto ingestible       = sirius::op::scan::make_ingestible(make_telemetry_nation_table_info(uri));
+  sirius::io::io_attribution const expected{
+    .query_uuid    = {0x1234, 0x5678},
+    .pipeline_uuid = {0x9abc, 0xdef0},
+    .device_id     = -1,
+    .phase         = sirius::io::io_phase::scan,
+  };
+  ingestible->set_io_attribution(expected);
+  auto task = ingestible->next_split_provider(
+    [&](std::string_view path) -> std::shared_ptr<sirius::io::sirius_ioctx> {
+      CHECK(path == uri);
+      return ioctx;
+    });
+  REQUIRE(task);
+
+  auto const before      = recorder->cursor();
+  auto const perf_before = ioctx->perf_snapshot();
+  auto scan              = task();
+  REQUIRE(scan != nullptr);
+  auto const records    = recorder->records_since(before);
+  auto const perf_after = ioctx->perf_snapshot();
+
+  std::size_t footer_reads = 0;
+  for (auto const& record : records.logical) {
+    if (record.attribution.phase != sirius::io::io_phase::scan ||
+        record.attribution.device_id != -1) {
+      continue;
+    }
+    ++footer_reads;
+    CHECK(record.attribution.query_uuid == expected.query_uuid);
+    CHECK(record.attribution.pipeline_uuid == expected.pipeline_uuid);
+    CHECK(record.route == sirius::io::io_route::direct);
+    CHECK(record.outcome == sirius::io::io_outcome::ok);
+    CHECK_FALSE(has_backend_record(records, record.read_id));
+  }
+  CHECK(footer_reads > 0);
+  CHECK(perf_after.payload_bytes_read_total > perf_before.payload_bytes_read_total);
 }
 
 TEST_CASE("IO telemetry off mode leaves a REST ioctx inert",
