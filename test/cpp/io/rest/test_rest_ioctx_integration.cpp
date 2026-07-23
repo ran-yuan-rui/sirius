@@ -18,6 +18,7 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_list_parser.hpp"
 #include "io/s3/s3_request_authorizer.hpp"
+#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
@@ -47,6 +48,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -56,7 +58,9 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -846,6 +850,129 @@ list_watchdog_result run_list_watchdog(range_http_server const& server,
   (void)::kill(pid, SIGKILL);
   (void)::waitpid(pid, &status, 0);
   return {.timed_out = true, .exited_normally = false, .exit_code = -1};
+}
+
+struct raw_aws_env {
+  std::string endpoint;
+  std::string region;
+  std::string access_key;
+  std::string secret_key;
+  std::string session_token;
+  std::string bucket;
+  std::string key;
+};
+
+bool raw_truthy_env(std::string const& name)
+{
+  auto value = env_or(name);
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+std::optional<raw_aws_env> read_raw_aws_env()
+{
+  auto unavailable = [](std::string const& message) -> std::optional<raw_aws_env> {
+    if (raw_truthy_env("SIRIUS_TEST_S3_STRICT")) { FAIL(message); }
+    SUCCEED(message);
+    return std::nullopt;
+  };
+
+  raw_aws_env env{env_or("SIRIUS_TEST_S3_ENDPOINT"),
+                  env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
+                  env_or("SIRIUS_TEST_S3_ACCESS_KEY"),
+                  env_or("SIRIUS_TEST_S3_SECRET_KEY"),
+                  env_or("SIRIUS_TEST_S3_SESSION_TOKEN"),
+                  env_or("SIRIUS_TEST_S3_BUCKET"),
+                  env_or("RAW_S3_KEY")};
+
+  if (env.endpoint.empty() || env.region.empty() || env.access_key.empty() ||
+      env.secret_key.empty() || env.bucket.empty()) {
+    return unavailable("SIRIUS_TEST_S3_* real-AWS environment is not complete");
+  }
+  if (env.session_token.empty()) {
+    return unavailable(
+      "SIRIUS_TEST_S3_SESSION_TOKEN is required; use assume-role temporary credentials");
+  }
+  if (env.endpoint != "https://s3." + env.region + ".amazonaws.com") {
+    return unavailable(
+      "SIRIUS_TEST_S3_ENDPOINT must be regional https://s3.<region>.amazonaws.com");
+  }
+  if (env.key.empty()) { return unavailable("RAW_S3_KEY is required for the raw-transport bench"); }
+  return env;
+}
+
+std::size_t raw_size_env(std::string const& name, std::size_t fallback, bool allow_zero = false)
+{
+  auto const text = env_or(name);
+  if (text.empty()) { return fallback; }
+
+  std::size_t value       = 0;
+  auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size() || (!allow_zero && value == 0)) {
+    throw std::invalid_argument(name + " must be " +
+                                (allow_zero ? "a non-negative" : "a positive") + " integer");
+  }
+  return value;
+}
+
+std::shared_ptr<rest_ioctx> make_raw_aws_ioctx(raw_aws_env const& env,
+                                               std::size_t n_reactors,
+                                               std::size_t max_connections,
+                                               std::size_t range_bytes)
+{
+  sirius::io::rest::config cfg{};
+  cfg.max_connections      = max_connections;
+  cfg.chunk_size           = range_bytes;
+  cfg.max_n_chunks         = 1;
+  cfg.perf_instrumentation = true;
+
+  sirius::io::s3::static_credentials creds;
+  creds.access_key_id     = env.access_key;
+  creds.secret_access_key = env.secret_key;
+  creds.session_token     = env.session_token;
+  auto authorizer         = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
+    std::move(creds), env.region, env.endpoint);
+  auto context = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+    cfg, std::move(authorizer), nullptr);
+  auto ioctx = std::make_shared<rest_ioctx>(n_reactors, std::move(context));
+  ioctx->start();
+  return ioctx;
+}
+
+std::string raw_json_escape(std::string_view value)
+{
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (char c : value) {
+    switch (c) {
+      case '\\':
+      case '"':
+        escaped.push_back('\\');
+        escaped.push_back(c);
+        break;
+      case '\n': escaped += "\\n"; break;
+      case '\r': escaped += "\\r"; break;
+      case '\t': escaped += "\\t"; break;
+      default: escaped.push_back(c); break;
+    }
+  }
+  return escaped;
+}
+
+std::filesystem::path raw_transport_json_path()
+{
+  auto const stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+#ifdef SIRIUS_UNITTEST_LOG_DIR
+  auto directory = std::filesystem::path{SIRIUS_UNITTEST_LOG_DIR};
+#else
+  auto directory =
+    project_root() / "build" / "release" / "extension" / "sirius" / "test" / "cpp" / "log";
+#endif
+  return directory / ("s3_rest_perf_raw_transport_" + std::to_string(stamp) + ".json");
 }
 
 }  // namespace
@@ -2389,4 +2516,136 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
     INFO("teardown completed in-flight request with exception: " << e.what());
     SUCCEED("future resolved with an exception during teardown");
   }
+}
+
+TEST_CASE("REST raw S3 transport reads one object through a configurable connection pool",
+          "[.][s3][bench][raw-transport][aws][live]")
+{
+  auto const env = read_raw_aws_env();
+  if (!env) { return; }
+
+  auto const range_bytes     = raw_size_env("RAW_RANGE_BYTES", 1UL << 20);
+  auto const n_reactors      = raw_size_env("RAW_REST_N_REACTORS", 2);
+  auto const max_connections = raw_size_env("RAW_MAX_CONNECTIONS", 16);
+  auto const min_reps        = raw_size_env("RAW_REPS", 1);
+  auto const min_seconds     = raw_size_env("RAW_MIN_SECONDS", 30, true);
+  if (max_connections > std::numeric_limits<std::size_t>::max() / n_reactors) {
+    throw std::invalid_argument("RAW_REST_N_REACTORS * RAW_MAX_CONNECTIONS overflows size_t");
+  }
+  auto const total_slots = n_reactors * max_connections;
+
+  auto ioctx = make_raw_aws_ioctx(*env, n_reactors, max_connections, range_bytes);
+  REQUIRE(ioctx->cache() == nullptr);
+  auto datasource = ioctx->open_datasource("s3://" + env->bucket + "/" + env->key);
+  REQUIRE(datasource != nullptr);
+  auto const object_bytes = datasource->size();
+  REQUIRE(object_bytes > 0);
+
+  std::vector<std::uint8_t> host_buffer(object_bytes);
+  auto const range_count = 1 + (object_bytes - 1) / range_bytes;
+  INFO("object has " << range_count << " ranges for " << total_slots << " connection slots");
+  REQUIRE(range_count >= total_slots);
+
+  std::vector<std::vector<sirius::io::io_object_segment>> batches(n_reactors);
+  for (std::size_t offset = 0, index = 0; offset < object_bytes; offset += range_bytes, ++index) {
+    auto const size = std::min(range_bytes, object_bytes - offset);
+    batches[index % n_reactors].emplace_back(offset, size, host_buffer.data() + offset);
+  }
+
+  auto read_once = [&] {
+    std::vector<sirius::exec::semi_future<std::size_t>> futures;
+    futures.reserve(batches.size());
+    // One vector-read call selects one reactor, so submit one batch per reactor.
+    for (auto& batch : batches) {
+      REQUIRE_FALSE(batch.empty());
+      futures.push_back(ioctx->host_read_ranges_async_io(datasource->io_object(), batch));
+    }
+
+    std::size_t bytes = 0;
+    for (auto& future : futures) {
+      auto const got = std::move(future).get();
+      REQUIRE(bytes <= object_bytes);
+      REQUIRE(got <= object_bytes - bytes);
+      bytes += got;
+    }
+    return bytes;
+  };
+
+  auto const before = ioctx->perf_snapshot();
+  REQUIRE(before.chunk_get_count == 0);
+  REQUIRE(before.ttfb_ns == 0);
+
+  std::size_t reps_completed      = 0;
+  std::uint64_t bytes_transferred = 0;
+  auto const start                = std::chrono::steady_clock::now();
+  auto const minimum_duration     = std::chrono::duration<double>{static_cast<double>(min_seconds)};
+  do {
+    auto const got = read_once();
+    REQUIRE(got == object_bytes);
+    if (got > std::numeric_limits<std::uint64_t>::max() - bytes_transferred) {
+      throw std::overflow_error("raw-transport byte counter overflow");
+    }
+    bytes_transferred += got;
+    ++reps_completed;
+  } while (reps_completed < min_reps ||
+           std::chrono::steady_clock::now() - start < minimum_duration);
+  auto const stop  = std::chrono::steady_clock::now();
+  auto const after = ioctx->perf_snapshot();
+
+  auto const elapsed_s = std::chrono::duration<double>(stop - start).count();
+  REQUIRE(elapsed_s > 0.0);
+  auto const get_count = after.chunk_get_count - before.chunk_get_count;
+  REQUIRE(reps_completed <= std::numeric_limits<std::size_t>::max() / range_count);
+  REQUIRE(get_count == range_count * reps_completed);
+  auto const payload_bytes = after.payload_bytes_read_total - before.payload_bytes_read_total;
+  CHECK(payload_bytes >= bytes_transferred);
+  CHECK(after.terminal_failures_total == before.terminal_failures_total);
+  CHECK(after.h2d_observed_count == before.h2d_observed_count);
+  CHECK(after.device_stream_sync_total == before.device_stream_sync_total);
+
+  auto const effective_gbps =
+    static_cast<double>(bytes_transferred) * 8.0 / elapsed_s / 1'000'000'000.0;
+  auto const avg_bytes_per_get =
+    static_cast<double>(bytes_transferred) / static_cast<double>(get_count);
+
+  std::ostringstream json;
+  json << std::fixed << std::setprecision(6) << "{\"git_sha\":\""
+       << raw_json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\"host\":\""
+       << raw_json_escape(env_or("HOSTNAME", "unknown")) << "\",\"backend\":\"rest_aws_raw\","
+       << "\"bucket\":\"" << raw_json_escape(env->bucket) << "\",\"key\":\""
+       << raw_json_escape(env->key) << "\",\"object_bytes\":" << object_bytes
+       << ",\"range_bytes\":" << range_bytes << ",\"rest_n_reactors\":" << n_reactors
+       << ",\"connections_per_reactor\":" << max_connections << ",\"total_slots\":" << total_slots
+       << ",\"elapsed_s\":" << elapsed_s << ",\"reps_completed\":" << reps_completed
+       << ",\"bytes_transferred\":" << bytes_transferred << ",\"effective_gbps\":" << effective_gbps
+       << ",\"get_count\":" << get_count << ",\"avg_bytes_per_get\":" << avg_bytes_per_get
+       << ",\"chunk_get_ns_total\":" << after.chunk_get_ns_total - before.chunk_get_ns_total
+       << ",\"chunk_get_ns_max\":" << after.chunk_get_ns_max
+       << ",\"queue_wait_ns_total\":" << after.queue_wait_ns_total - before.queue_wait_ns_total
+       << ",\"queue_wait_count\":" << after.queue_wait_count - before.queue_wait_count
+       << ",\"first_get_complete_ns\":" << after.ttfb_ns
+       << ",\"retries_total\":" << after.retries_total - before.retries_total
+       << ",\"terminal_failures_total\":"
+       << after.terminal_failures_total - before.terminal_failures_total
+       << ",\"payload_bytes_read_total\":" << payload_bytes << ",\"blocking_host_get_count\":"
+       << after.blocking_host_get_count - before.blocking_host_get_count
+       << ",\"blocking_host_get_wall_ns_total\":"
+       << after.blocking_host_get_wall_ns_total - before.blocking_host_get_wall_ns_total
+       << ",\"blocking_host_get_wall_ns_max\":" << after.blocking_host_get_wall_ns_max
+       << ",\"h2d_observed_ns_total\":"
+       << after.h2d_observed_ns_total - before.h2d_observed_ns_total
+       << ",\"h2d_observed_count\":" << after.h2d_observed_count - before.h2d_observed_count
+       << ",\"h2d_observed_ns_max\":" << after.h2d_observed_ns_max
+       << ",\"device_stream_sync_total\":"
+       << after.device_stream_sync_total - before.device_stream_sync_total << "}";
+
+  auto const output_path = raw_transport_json_path();
+  std::filesystem::create_directories(output_path.parent_path());
+  std::ofstream output(output_path);
+  REQUIRE(output);
+  output << json.str() << '\n';
+  output.close();
+  REQUIRE(output);
+  WARN(json.str());
+  WARN("Wrote raw S3 transport JSON to " << output_path.string());
 }
