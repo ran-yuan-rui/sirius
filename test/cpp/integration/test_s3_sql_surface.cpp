@@ -33,6 +33,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -67,6 +68,50 @@ bool truthy_env(std::string_view name)
 {
   auto value = env_or(name);
   return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
+}
+
+std::string_view trim_ascii_whitespace(std::string_view value)
+{
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+    value.remove_prefix(1);
+  }
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+    value.remove_suffix(1);
+  }
+  return value;
+}
+
+std::vector<std::size_t> positive_size_list_env(std::string_view name,
+                                                std::vector<std::size_t> fallback)
+{
+  auto const text = env_or(name);
+  if (text.empty()) { return fallback; }
+
+  std::vector<std::size_t> values;
+  for (std::size_t begin = 0;;) {
+    auto const comma = text.find(',', begin);
+    auto const token = trim_ascii_whitespace(
+      std::string_view{text}.substr(begin, comma == std::string::npos ? comma : comma - begin));
+    std::size_t value       = 0;
+    auto const [end, error] = std::from_chars(token.data(), token.data() + token.size(), value);
+    if (token.empty() || error != std::errc{} || end != token.data() + token.size() || value == 0) {
+      throw std::invalid_argument(std::string{name} +
+                                  " must be a comma-separated list of positive integers");
+    }
+    values.push_back(value);
+    if (comma == std::string::npos) { break; }
+    begin = comma + 1;
+  }
+  return values;
+}
+
+std::size_t positive_size_env(std::string_view name, std::size_t fallback)
+{
+  auto const values = positive_size_list_env(name, {fallback});
+  if (values.size() != 1) {
+    throw std::invalid_argument(std::string{name} + " must contain exactly one positive integer");
+  }
+  return values.front();
 }
 
 class scoped_env_var {
@@ -1647,15 +1692,17 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                                          std::vector<std::string> columns,
                                          std::size_t rest_max_connections,
                                          std::optional<duckdb::idx_t> expected_rows,
-                                         bool use_footer_probe = false)
+                                         bool use_footer_probe       = false,
+                                         std::size_t rest_n_reactors = 2)
 {
   INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
                    << " columns=" << columns.size() << " max_connections=" << rest_max_connections
+                   << " rest_n_reactors=" << rest_n_reactors
                    << " use_footer_probe=" << use_footer_probe);
   auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
   limits.rest_perf_instrumentation = true;
   limits.rest_max_connections      = rest_max_connections;
-  limits.rest_n_reactors           = std::size_t{2};
+  limits.rest_n_reactors           = rest_n_reactors;
   limits.gpu_usage                 = "8 GiB";
   limits.gpu_reservation           = "3 GiB";
   limits.host_capacity             = "12 GiB";
@@ -2323,9 +2370,12 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
   auto const object_key  = aws_bench_lineitem_key();
   auto const uri         = aws_bench_lineitem_uri(*env);
   auto baseline_json     = read_optional_text_file(perf_baseline_path(backend));
+  auto const max_connections_values =
+    positive_size_list_env("SIRIUS_BENCH_MC", {std::size_t{1}, std::size_t{32}});
+  auto const rest_n_reactors = positive_size_env("SIRIUS_BENCH_N_REACTORS", 2);
 
   std::vector<bench_record> records;
-  records.reserve(8);
+  records.reserve(4 * max_connections_values.size());
 
   std::optional<duckdb::idx_t> projected_rows;
   std::optional<duckdb::idx_t> full_rows;
@@ -2334,13 +2384,15 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
   std::optional<std::uint64_t> full_payload_bytes;
   std::optional<std::uint64_t> full_probe_payload_bytes;
 
-  for (auto max_connections : {std::size_t{1}, std::size_t{32}}) {
+  for (auto max_connections : max_connections_values) {
     auto projected = run_rest_aws_bench_scenario(*env,
                                                  uri,
                                                  "aws_https_projected",
                                                  bench_single_column_projection(),
                                                  max_connections,
-                                                 projected_rows);
+                                                 projected_rows,
+                                                 /*use_footer_probe=*/false,
+                                                 rest_n_reactors);
     if (!projected_rows.has_value()) { projected_rows = projected.row_count; }
     if (!projected_payload_bytes.has_value()) {
       projected_payload_bytes = projected.payload_bytes_read;
@@ -2364,7 +2416,8 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
                                                        bench_single_column_projection(),
                                                        max_connections,
                                                        projected_rows,
-                                                       /*use_footer_probe=*/true);
+                                                       /*use_footer_probe=*/true,
+                                                       rest_n_reactors);
     if (!projected_probe_payload_bytes.has_value()) {
       projected_probe_payload_bytes = projected_probe.payload_bytes_read;
     }
@@ -2381,8 +2434,14 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     attach_baseline_comparison(projected_probe, baseline_json, backend);
     records.push_back(std::move(projected_probe));
 
-    auto full = run_rest_aws_bench_scenario(
-      *env, uri, "aws_https_full", bench_full_lineitem_projection(), max_connections, full_rows);
+    auto full = run_rest_aws_bench_scenario(*env,
+                                            uri,
+                                            "aws_https_full",
+                                            bench_full_lineitem_projection(),
+                                            max_connections,
+                                            full_rows,
+                                            /*use_footer_probe=*/false,
+                                            rest_n_reactors);
     if (!full_rows.has_value()) { full_rows = full.row_count; }
     if (!full_payload_bytes.has_value()) { full_payload_bytes = full.payload_bytes_read; }
     CHECK(full.row_count == *full_rows);
@@ -2402,7 +2461,8 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
                                                   bench_full_lineitem_projection(),
                                                   max_connections,
                                                   full_rows,
-                                                  /*use_footer_probe=*/true);
+                                                  /*use_footer_probe=*/true,
+                                                  rest_n_reactors);
     if (!full_probe_payload_bytes.has_value()) {
       full_probe_payload_bytes = full_probe.payload_bytes_read;
     }
@@ -2419,7 +2479,7 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
     attach_baseline_comparison(full_probe, baseline_json, backend);
     records.push_back(std::move(full_probe));
   }
-  REQUIRE(records.size() == 8);
+  REQUIRE(records.size() == 4 * max_connections_values.size());
 
   auto dataset_bytes = std::uint64_t{0};
   for (auto const& record : records) {

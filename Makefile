@@ -25,7 +25,7 @@ BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
 	s3-test s3-test-large s3-tpch \
-	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench
+	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench s3-bench-sweep
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -255,3 +255,19 @@ s3-bench:
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
 	export HOSTNAME="$${HOSTNAME:-$$(hostname)}"; \
 	$(S3_TEST_BIN) "$$selector"
+
+# Concurrency-scaling sweep (manual, real-AWS only). Drives the raw-transport bench
+# and the SQL bench across a connection sweep (P = R x C = rest_n_reactors x
+# max_connections), wrapping each point with kernel NIC (/proc/net/dev) + ENA
+# allowance (ethtool -S) + socket/CPU/GPU ground-truth the C++ benches don't emit.
+# Manual only, needs an idle host with ethtool/ss/sar and the SIRIUS_TEST_S3_* env
+# (regional endpoint, bucket, assume-role TEMPORARY creds incl. session token) plus
+# RAW_S3_KEY. Tune SWEEP_MODE={raw,sql,both}, SWEEP_P, SWEEP_R, SWEEP_MIN_SECONDS.
+# Merged results append to doc/s3support/perf-history-concurrency.jsonl; sampler logs
+# land under build/release/.../log/concurrency-sweep/.
+s3-bench-sweep:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-bench-sweep: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@S3_TEST_BIN="$(S3_TEST_BIN)" test/cpp/integration/s3/run_concurrency_sweep.sh
