@@ -36,6 +36,14 @@ option(ENABLE_STREAM_CHECK
 option(SIRIUS_BUILD_S3_TESTS
        "Build the testcontainers-backed S3 integration test harness" ON)
 
+# The Lance vector-search scan source embeds a pinned Rust FFI (Lance + Arrow +
+# DataFusion), so it needs a Rust toolchain, protoc, and network on the first
+# build. OFF by default: the seam is an abstract interface, so the lifecycle
+# code and its fake-driven unit tests build and run without any of that. Turn ON
+# for the end-to-end arm that talks to a real Lance dataset.
+option(SIRIUS_ENABLE_LANCE_KNN
+       "Build the experimental embedded Lance vector-search scan source" OFF)
+
 # In the vcpkg build, vcpkg headers must take priority over: 1) conda's CCCL
 # 3.1.4 (injected via CXXFLAGS as -I.../include/cccl) 2) DuckDB's bundled fmt
 # 6.1.2 (uses duckdb_fmt namespace, incompatible with spdlog) Fix: strip conda
@@ -302,6 +310,11 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/lance/lance_arrow_batch.cpp
+    src/op/scan/lance/lance_gpu_ingestible.cpp
+    src/op/scan/lance/lance_split_producer.cpp
+    src/lance_shim/lance_ffi_api.cpp
+    src/lance_shim/lance_table_function.cpp
     src/op/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
@@ -733,6 +746,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
     test/cpp/scan/test_gpu_decode_strings.cpp
+    test/cpp/scan/test_lance_arrow_source.cpp
     test/cpp/scan/test_host_keep_mask.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
@@ -765,6 +779,14 @@ if(SIRIUS_BUILD_S3_TESTS)
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
+endif()
+
+# The Lance end-to-end arm drives a real dataset through the embedded FFI, so it
+# only compiles when that source is built. The fake-driven unit coverage in
+# test/cpp/scan/test_lance_arrow_source.cpp is unconditional.
+if(SIRIUS_ENABLE_LANCE_KNN)
+  list(APPEND TEST_SOURCES
+       test/cpp/integration/test_lance_vector_search_e2e.cpp)
 endif()
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are

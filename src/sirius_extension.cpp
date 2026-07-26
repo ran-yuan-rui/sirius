@@ -89,6 +89,7 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
+#include "lance_shim/lance_table_function.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -1619,6 +1620,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
+
+  sirius::lance::register_lance_vector_search(catalog, transaction);
 }
 
 // Process-global Config writes are refused once the Sirius runtime is
@@ -2067,6 +2070,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CACHING),
     SetUsePinMemoryForCaching);
+
+  // Runtime kill switch for the Lance vector-search scan source. Checked during
+  // bind, so flipping it stops routing without rebuilding.
+  config.AddExtensionOption("sirius_lance_knn_enabled",
+                            "Whether sirius_lance_vector_search may bind",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(true));
+
+  config.AddExtensionOption("sirius_lance_max_k",
+                            "Upper bound on k for sirius_lance_vector_search",
+                            LogicalType::BIGINT,
+                            Value::BIGINT(1000000));
 
   // Add in config option for expression executor
   config.AddExtensionOption("use_cudf_expr",

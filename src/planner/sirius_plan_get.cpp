@@ -31,6 +31,7 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/type_conversions.hpp"
+#include "lance_shim/lance_bind_data.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/sirius_physical_filter.hpp"
@@ -94,7 +95,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Only GPU-route known table scan functions; all others (pragma, system catalog
   // functions, etc.) must fall back to CPU.
   static const std::unordered_set<std::string> kSupportedScanFunctions = {
-    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet"};
+    "seq_scan",
+    "parquet_scan",
+    "read_parquet",
+    "sirius_read_parquet",
+    sirius::lance::kLanceVectorSearchName};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
     throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
                                           op.function.name);

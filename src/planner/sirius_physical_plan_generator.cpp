@@ -32,8 +32,11 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "helper/type_conversions.hpp"
+#include "lance_shim/lance_bind_data.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/lance/lance_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
@@ -142,6 +145,83 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
   // task skips the hive-partition columns it should inject post-read, mis-sizing the output.
   info->scan_output_arity      = scan_op.types.size();
   info->approximate_batch_size = op_params.scan_task_batch_size;
+  return info;
+}
+
+//! Build a `lance_ingestible_table_info` from a `sirius_lance_vector_search` TABLE_SCAN.
+//! Bind already validated the schema and resolved every candidate column; this narrows
+//! that set to the columns the plan actually projects.
+std::unique_ptr<sirius::op::scan::lance_ingestible_table_info> build_lance_table_info(
+  sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
+{
+  auto const* bind =
+    dynamic_cast<sirius::lance::lance_vector_search_bind_data const*>(scan_op.bind_data.get());
+  if (bind == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::build_lance_table_info] sirius_lance_vector_search "
+      "bind_data is missing or of an unexpected type");
+  }
+
+  auto info             = std::make_unique<sirius::op::scan::lance_ingestible_table_info>();
+  info->api             = bind->api;
+  info->spec            = bind->spec;
+  info->producer_config = {.queue_depth     = op_params.lance_queue_depth,
+                           .max_arrow_bytes = op_params.lance_max_arrow_bytes};
+
+  std::vector<std::size_t> source_ids_fallback;
+  if (scan_op.projection_ids.empty()) {
+    source_ids_fallback.resize(scan_op.column_ids.size());
+    std::iota(source_ids_fallback.begin(), source_ids_fallback.end(), 0);
+  }
+  auto const& source_ids =
+    scan_op.projection_ids.empty() ? source_ids_fallback : scan_op.projection_ids;
+
+  auto const& bound = bind->expect;
+  for (std::size_t k = 0; k < source_ids.size(); ++k) {
+    auto const& col_idx = scan_op.column_ids[source_ids[k]];
+    if (col_idx.IsEmptyColumn()) {
+      // `SELECT count(*)` projects nothing, so DuckDB pushes the empty virtual
+      // column purely to carry the row stream. It backs no storage and must not
+      // be materialized; skipping it leaves `names` empty, which hands the
+      // decision to the forced-column fallback below.
+      continue;
+    }
+    if (col_idx.IsRowIdColumn()) {
+      // Lance KNN results carry no stable row identity: the FFI never emits
+      // `_rowid`, so there is nothing to project. Refusing here keeps the plan
+      // honest instead of silently backing `rowid` with some other column.
+      // Reachable because the table function does declare a rowid virtual
+      // column — see lance_table_function.cpp for why it also declares the
+      // empty one, without which count(*) would land on this same branch.
+      throw duckdb::NotImplementedException(
+        "sirius_lance_vector_search does not expose rowid: the Lance KNN surface emits no row "
+        "identity, so join on a business key instead");
+    }
+    auto const primary = col_idx.GetPrimaryIndex();
+    if (primary >= bound.kept_child_indices.size()) {
+      throw std::runtime_error(
+        "[sirius_physical_plan_generator::build_lance_table_info] projected column index is out "
+        "of range for the bound Lance schema");
+    }
+    info->expect.kept_child_indices.push_back(bound.kept_child_indices[primary]);
+    info->expect.kept_formats.push_back(bound.kept_formats[primary]);
+    info->expect.kept_names.push_back(bound.kept_names[primary]);
+    info->names.push_back(bind->names[primary]);
+    info->output_types.push_back(sirius::from_duckdb(bind->return_types[primary]));
+    info->materialized_order.push_back(k);
+  }
+
+  if (info->names.empty()) {
+    // count(*) projects nothing. Emitting a 0-column table would erase the row
+    // count downstream aggregation consumes, so keep the first bound column.
+    info->expect.kept_child_indices.push_back(bound.kept_child_indices.front());
+    info->expect.kept_formats.push_back(bound.kept_formats.front());
+    info->expect.kept_names.push_back(bound.kept_names.front());
+    info->names.push_back(bind->names.front());
+    info->output_types.push_back(sirius::from_duckdb(bind->return_types.front()));
+    info->materialized_order.push_back(0);
+  }
+
   return info;
 }
 
@@ -293,6 +373,15 @@ void wrap_table_scan_source(
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
+    replace_slot = true;
+  } else if (fn == sirius::lance::kLanceVectorSearchName) {
+    // A Lance scan carries no filters (the table function registers without
+    // filter pushdown), so its wrapped DYNAMIC_FILTER only ever sees membership
+    // masks published by a downstream join.
+    leaf         = make_gpu_scan_leaf(build_lance_table_info(scan, op_params),
+                              scan,
+                              op_params,
+                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
     // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped

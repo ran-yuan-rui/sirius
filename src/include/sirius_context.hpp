@@ -70,6 +70,25 @@ namespace duckdb {
 /// cross-connection synchronization. A ClientContext serializes its own
 /// operations, so the non-atomic members need no lock; the depth counters stay
 /// atomic because sirius_httpfs may read them from IO threads.
+/// \brief Properties of the optimized plan that must survive a failed plan copy.
+///
+/// Read by the optimizer hook *before* it attempts the copy: on the replan path
+/// the copy threw and there is no plan left to inspect, and the only remaining
+/// signal would be the SQL text — which a view body hides.
+struct sirius_plan_capabilities {
+  /// The plan reads s3://, which has no CPU path in Sirius.
+  bool reads_s3{false};
+  /// The plan contains a source that only exists on the GPU. A failure anywhere
+  /// in such a plan must surface as itself rather than be retried on CPU, where
+  /// the source does not exist at all.
+  bool has_gpu_only_source{false};
+
+  [[nodiscard]] bool forbids_cpu_fallback() const noexcept
+  {
+    return reads_s3 || has_gpu_only_source;
+  }
+};
+
 class SiriusConnectionState : public ClientContextState {
  public:
   SiriusConnectionState();
@@ -110,6 +129,29 @@ class SiriusConnectionState : public ClientContextState {
   {
     captured_plan_       = std::move(plan);
     captured_generation_ = planning_generation_;
+  }
+
+  /// \brief Record what the optimized plan touches, stamped like the capture.
+  ///
+  /// Deliberately separate from set_captured_plan and called BEFORE the copy:
+  /// when copy_logical_plan throws there is no capture at all, and this is the
+  /// only thing left telling the replan path that the query was GPU-only.
+  void set_plan_capabilities(sirius_plan_capabilities capabilities)
+  {
+    captured_capabilities_            = capabilities;
+    captured_capabilities_generation_ = planning_generation_;
+  }
+
+  /// \brief Capabilities of the current planning attempt, or "nothing special"
+  /// if they belong to an older attempt. Unlike the plan, these are NOT consumed
+  /// — OnFinalizePrepare reads them after taking the plan, and again on failure.
+  ///
+  /// The default is the conservative reading: a plan we know nothing about is
+  /// allowed to fall back to CPU.
+  [[nodiscard]] sirius_plan_capabilities captured_plan_capabilities() const noexcept
+  {
+    if (captured_capabilities_generation_ != planning_generation_) { return {}; }
+    return captured_capabilities_;
   }
 
   /// \brief Consume the capture iff it belongs to the CURRENT planning attempt;
@@ -168,6 +210,10 @@ class SiriusConnectionState : public ClientContextState {
   uint64_t captured_generation_ = 0;
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
+  /// Read off the plan before the copy, so it outlives a copy failure. Carries
+  /// its own generation: the copy can fail while these still stand.
+  sirius_plan_capabilities captured_capabilities_;
+  uint64_t captured_capabilities_generation_ = 0;
   /// Label set by `sirius_set_query_label`, consumed by the next
   /// sirius_interface construction on this connection.
   std::optional<std::string> pending_query_label_;

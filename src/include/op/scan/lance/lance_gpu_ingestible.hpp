@@ -25,6 +25,7 @@
 // standard library
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <span>
 #include <string>
@@ -121,6 +122,13 @@ class lance_scan_info : public op::scan::scan_info {
   /// batches at all: zero splits would mean the pipeline-completion signal
   /// never fires. Materializes to a correctly-typed zero-row table.
   bool is_empty_sentinel{false};
+
+  /// A producer-side failure carried as data. Errors must reach the scan task
+  /// and be rethrown during materialization: failing the metadata channel
+  /// instead closes the split connector before the first task-creation poll,
+  /// and a source whose connector is already closed never gets a task — the
+  /// error is never consumed and the pipeline's completion signal is lost.
+  std::exception_ptr poison;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override { return decoded_bytes; }
 };

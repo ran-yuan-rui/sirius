@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "sirius_context.hpp"
+
 #include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
@@ -44,6 +46,14 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 /// \param plan     The plan to copy. Not consumed; \c filter_pushdown / \c dynamic_filters are left
 ///                 on the original so DuckDB's CPU fallback path can still see them.
 /// \param context  DuckDB client context for \c LogicalOperator::Copy.
+/// \brief Read the fallback-relevant properties of an optimized logical plan.
+///
+/// Must run before the plan is copied or consumed: on the replan path the copy
+/// has already thrown and there is no plan left to walk, yet the decision of
+/// whether a CPU retry is even legal still has to be made.
+[[nodiscard]] duckdb::sirius_plan_capabilities read_plan_capabilities(
+  duckdb::LogicalOperator const& plan);
+
 [[nodiscard]] duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(
   duckdb::LogicalOperator const& plan, duckdb::ClientContext& context);
 

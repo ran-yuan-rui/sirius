@@ -16,16 +16,20 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
+#include "lance_shim/lance_bind_data.hpp"
 #include "planner/duckdb_join_filter_candidate_adapter.hpp"
 #include "sirius_context.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
+#include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <log/logging.hpp>
 
 #include <exception>
+#include <string_view>
 #include <utility>
 
 namespace sirius::transparent {
@@ -39,7 +43,45 @@ bool gpu_execution_enabled(const duckdb::ClientContext& context)
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
 }
 
+/// Accumulates capabilities over the whole plan tree.
+void collect_plan_capabilities(duckdb::LogicalOperator const& op,
+                               duckdb::sirius_plan_capabilities& out)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto const& get = op.Cast<duckdb::LogicalGet>();
+
+    // A GPU-only source is identified by the function that produced it, which
+    // survives everything a view or a rewrite can do to the SQL text.
+    if (get.function.name == sirius::lance::kLanceVectorSearchName) {
+      out.has_gpu_only_source = true;
+    }
+
+    if (auto const* mf = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get())) {
+      if (mf->file_list) {
+        for (auto const& file : mf->file_list->GetAllFiles()) {
+          std::string_view const path{file.path};
+          if (path.size() > 5 && (path[0] == 's' || path[0] == 'S') && path[1] == '3' &&
+              path.substr(2, 3) == "://") {
+            out.reads_s3 = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+  for (auto const& child : op.children) {
+    collect_plan_capabilities(*child, out);
+  }
+}
+
 }  // namespace
+
+duckdb::sirius_plan_capabilities read_plan_capabilities(duckdb::LogicalOperator const& plan)
+{
+  duckdb::sirius_plan_capabilities capabilities;
+  collect_plan_capabilities(plan, capabilities);
+  return capabilities;
+}
 
 duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
                                                               duckdb::ClientContext& context)
@@ -60,6 +102,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx || !ctx->is_initialized()) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
+
+  // Read what the plan touches BEFORE attempting the copy. When the copy throws
+  // there is nothing left to inspect, and the replan path would otherwise have
+  // to guess from the SQL text — which a view body hides.
+  conn_state->set_plan_capabilities(read_plan_capabilities(*plan));
 
   // Copy the optimized plan into THIS connection's per-connection state,
   // stamped with the current planning generation. OnFinalizePrepare will

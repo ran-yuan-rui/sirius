@@ -130,6 +130,21 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  // New fields go at the end. Inserting one mid-struct shifts every field after
+  // it, and a translation unit compiled against the older layout then reads a
+  // neighbour's value — which surfaced once as a division by zero deep inside
+  // hash-join partition sizing rather than as anything resembling a config bug.
+
+  /// How far the Lance producer may run ahead of the scan driver, in batches.
+  /// Bounds producer run-ahead only; the driver's own connector is unbounded, so
+  /// total host residency is bounded by @ref lance_max_arrow_bytes instead.
+  uint64_t lance_queue_depth = 4;
+
+  /// Cumulative cap on Arrow bytes a single Lance scan may accept, counting
+  /// every column including the vector column Lance materializes whether or not
+  /// the query projects it. 0 disables the cap.
+  uint64_t lance_max_arrow_bytes = 256ULL << 20;
 };
 
 struct telemetry_config {

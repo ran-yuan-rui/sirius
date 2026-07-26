@@ -191,6 +191,8 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
              opt.dynamic_filter_domain_coverage_threshold);
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
+  r.optional("lance_queue_depth", opt.lance_queue_depth);
+  r.optional("lance_max_arrow_bytes", yaml::bytes(opt.lance_max_arrow_bytes));
   r.reject_unknown();
 }
 

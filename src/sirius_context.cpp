@@ -1007,27 +1007,9 @@ void SiriusContext::record_transparent_runtime_fallback() noexcept
 
 namespace {
 
-bool logical_plan_reads_s3(duckdb::LogicalOperator const& op)
-{
-  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
-    auto const& get = op.Cast<duckdb::LogicalGet>();
-    if (auto const* mf = dynamic_cast<duckdb::MultiFileBindData const*>(get.bind_data.get())) {
-      if (mf->file_list) {
-        for (auto const& file : mf->file_list->GetAllFiles()) {
-          auto const& p = file.path;
-          if (p.size() > 5 && (p[0] == 's' || p[0] == 'S') && p[1] == '3' && p[2] == ':' &&
-              p[3] == '/' && p[4] == '/') {
-            return true;
-          }
-        }
-      }
-    }
-  }
-  for (auto const& child : op.children) {
-    if (logical_plan_reads_s3(*child)) { return true; }
-  }
-  return false;
-}
+// Superseded by sirius::transparent::read_plan_capabilities, which reads the same
+// s3:// signal plus the GPU-only-source signal in one walk, and is called by the
+// optimizer hook BEFORE the plan copy so it survives a copy failure.
 
 // S3 is GPU-only. When a transparent query that reads s3:// fails on the GPU
 // path, refuse to fall back to CPU: DuckDB's CPU read_parquet would re-read the
@@ -1037,15 +1019,34 @@ bool logical_plan_reads_s3(duckdb::LogicalOperator const& op)
 // references_sirius_owned_s3_parquet on the query text is a secondary signal.
 // Non-s3 (local) queries fall through to the normal CPU fallback. Surfaces the
 // same clear error the gpu_execution(...) path raises.
-void throw_if_s3_no_cpu_fallback(bool plan_reads_s3,
-                                 std::string const& query_sql,
-                                 std::string const& gpu_error)
+void throw_if_no_cpu_fallback(sirius_plan_capabilities capabilities,
+                              std::string const& query_sql,
+                              duckdb::ErrorData const& gpu_error)
 {
-  if (plan_reads_s3 || sirius::references_sirius_owned_s3_parquet(query_sql)) {
+  // A user interrupt is never a fallback decision: it propagates with its type
+  // intact no matter what the plan touches, or cancellation would surface as a
+  // fabricated engine error.
+  if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) {
+    duckdb::ErrorData copy = gpu_error;
+    copy.Throw();
+  }
+
+  if (capabilities.has_gpu_only_source) {
+    // The source does not exist outside the GPU path, so retrying on CPU would
+    // replace a real diagnostic with a confusing "no such execution path".
+    // ExecutorException also sanitizes INTERNAL/FATAL, which would otherwise
+    // poison the whole session.
+    throw duckdb::ExecutorException(
+      "sirius_lance_vector_search is GPU-only: this query cannot run on CPU, and GPU execution "
+      "failed. Underlying error: " +
+      gpu_error.RawMessage());
+  }
+
+  if (capabilities.reads_s3 || sirius::references_sirius_owned_s3_parquet(query_sql)) {
     throw std::runtime_error(
       "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
       "Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
-      gpu_error);
+      gpu_error.RawMessage());
   }
 }
 
@@ -1123,7 +1124,14 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // the unbound SQL statement — this is what gpu_execution(...) does
   // internally and it works even when LogicalGet::Copy can't.
   unique_ptr<LogicalOperator> logical_plan;
-  if (conn_state) { logical_plan = conn_state->take_captured_plan_if_current(); }
+  // Capabilities are read, not consumed: the optimizer hook recorded them before
+  // it attempted the copy, so they stand even on the replan path where the copy
+  // threw and there is no plan left to inspect.
+  sirius_plan_capabilities captured_capabilities;
+  if (conn_state) {
+    logical_plan          = conn_state->take_captured_plan_if_current();
+    captured_capabilities = conn_state->captured_plan_capabilities();
+  }
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
@@ -1160,9 +1168,10 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (NotImplementedException& e) {
-      // No captured plan to inspect on the replan path; guard on the SQL text so
-      // a direct read_parquet('s3://') that fails to re-plan does not CPU-fall-back.
-      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      // The copy failed, so there is no plan here — but the hook read the
+      // capabilities before copying, which is exactly what a view body would
+      // have hidden from the SQL-text guard.
+      throw_if_no_cpu_fallback(captured_capabilities, current_query_sql, duckdb::ErrorData(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
@@ -1170,7 +1179,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", e.what());
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
-      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      throw_if_no_cpu_fallback(captured_capabilities, current_query_sql, duckdb::ErrorData(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
@@ -1183,8 +1192,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
   // Detect an s3:// read from the plan now, while logical_plan is still intact
   // (create_plan below consumes it). S3 is GPU-only: if GPU translation fails we
-  // must NOT fall back to CPU for s3:// (see throw_if_s3_no_cpu_fallback).
-  bool const plan_reads_s3 = logical_plan_reads_s3(*logical_plan);
+  // must NOT fall back to CPU for s3:// (see throw_if_no_cpu_fallback).
+  auto capabilities = sirius::transparent::read_plan_capabilities(*logical_plan);
+  capabilities.reads_s3 |= captured_capabilities.reads_s3;
+  capabilities.has_gpu_only_source |= captured_capabilities.has_gpu_only_source;
+  bool const plan_reads_s3 = capabilities.reads_s3;
 
   try {
     // Plan-generation window: create_plan below reads the scan manager's pin
@@ -1243,7 +1255,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                                             prepared.types,
                                                                             prepared.names,
                                                                             std::move(cpu_fallback),
-                                                                            plan_reads_s3,
+                                                                            capabilities,
                                                                             0);
     new_physical_plan->SetRoot(sirius_op);
 
@@ -1264,14 +1276,14 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}", e.what());
     return RebindQueryInfo::DO_NOT_REBIND;
   } catch (NotImplementedException& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    throw_if_no_cpu_fallback(capabilities, current_query_sql, duckdb::ErrorData(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", e.what());
   } catch (std::exception& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    throw_if_no_cpu_fallback(capabilities, current_query_sql, duckdb::ErrorData(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
