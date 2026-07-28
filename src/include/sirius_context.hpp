@@ -274,13 +274,41 @@ class SiriusContext : public ClientContextState {
   /// \brief Whether the shared query lifecycle slot is currently held by any connection.
   [[nodiscard]] bool is_query_lifecycle_active() const noexcept;
 
-  /// \brief Store a captured logical plan for transparent GPU execution.
-  /// Called by the optimizer extension hook after copying the optimized logical plan.
+  /// \brief Properties of the optimized plan that outlive the plan itself.
+  ///
+  /// Read by the optimizer hook *before* it copies the plan, so they survive a
+  /// copy failure. Without that, the replan path in OnFinalizePrepare has no
+  /// plan left to inspect and can only guess from the SQL text — which says
+  /// nothing when a view hides the source.
+  struct plan_capabilities {
+    /// The plan reads s3://, which has no CPU path in Sirius.
+    bool reads_s3{false};
+
+    [[nodiscard]] bool forbids_cpu_fallback() const noexcept { return reads_s3; }
+  };
+
+  /// \brief Store a captured logical plan together with what was read off it.
+  /// Called by the optimizer extension hook. The capabilities are recorded even
+  /// when the copy failed and @p plan is null, so the two never drift apart.
+  void set_captured_logical_plan(duckdb::unique_ptr<duckdb::LogicalOperator> plan,
+                                 plan_capabilities capabilities);
+
+  /// \brief Overload for callers with nothing to say about the plan, which is
+  /// the conservative reading: an unclassified plan may fall back to CPU.
+  /// (A defaulted argument cannot be used — plan_capabilities is a nested class,
+  /// and its member initializers are not available until this class is complete.)
   void set_captured_logical_plan(duckdb::unique_ptr<duckdb::LogicalOperator> plan);
 
   /// \brief Take ownership of the captured logical plan (moves it out).
-  /// Called by OnFinalizePrepare to generate the Sirius physical plan.
+  /// Called by OnFinalizePrepare to generate the Sirius physical plan. The
+  /// capabilities deliberately survive the take — the replan path needs them
+  /// after the plan is gone.
   duckdb::unique_ptr<duckdb::LogicalOperator> take_captured_logical_plan();
+
+  /// \brief Capabilities recorded alongside the captured plan. Defaults to
+  /// "nothing special", the conservative reading: a plan we know nothing about
+  /// is allowed to fall back to CPU.
+  [[nodiscard]] plan_capabilities captured_plan_capabilities() const noexcept;
 
   /// \brief Stash a label for the next query to pick up and use as a telemetry
   /// label for easy identification. Set by the `sirius_set_query_label` SQL
@@ -376,6 +404,15 @@ class SiriusContext : public ClientContextState {
   /// Captured optimized logical plan for transparent GPU execution.
   /// Set by the optimizer extension hook, consumed by OnFinalizePrepare.
   duckdb::unique_ptr<duckdb::LogicalOperator> captured_logical_plan_;
+
+  /// Capabilities read off the plan before it was copied. Cleared with the plan
+  /// by @ref clear_captured_plan so a later query cannot inherit them.
+  plan_capabilities captured_plan_capabilities_;
+
+  /// \brief Drop the captured plan and its capabilities together.
+  /// Every site that discards a captured plan goes through this, so the two
+  /// cannot fall out of step.
+  void clear_captured_plan() noexcept;
 
   /// Label set by the `sirius_set_query_label` SQL function, consumed at the
   /// next sirius_interface construction site. Cleared on take.

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "sirius_context.hpp"  // duckdb::SiriusContext::plan_capabilities
+
 #include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
@@ -51,5 +53,13 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 /// \param context  DuckDB client context for \c LogicalOperator::Copy.
 [[nodiscard]] duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(
   duckdb::LogicalOperator const& plan, duckdb::ClientContext& context);
+
+/// Read the properties of \p plan that the fallback decision depends on.
+///
+/// Call this before copying the plan: the copy can fail, and the replan path in
+/// \c OnFinalizePrepare then has nothing left to inspect. The SQL text is not a
+/// substitute — a view body hides the source it reads.
+[[nodiscard]] duckdb::SiriusContext::plan_capabilities read_plan_capabilities(
+  duckdb::LogicalOperator const& plan);
 
 }  // namespace sirius::transparent
