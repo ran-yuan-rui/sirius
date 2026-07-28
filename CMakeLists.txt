@@ -44,6 +44,10 @@ option(SIRIUS_BUILD_S3_TESTS
 option(SIRIUS_ENABLE_LANCE_KNN
        "Build the experimental embedded Lance vector-search scan source" OFF)
 
+if(SIRIUS_ENABLE_LANCE_KNN)
+  include(cmake/lance_ffi.cmake)
+endif()
+
 # In the vcpkg build, vcpkg headers must take priority over: 1) conda's CCCL
 # 3.1.4 (injected via CXXFLAGS as -I.../include/cccl) 2) DuckDB's bundled fmt
 # 6.1.2 (uses duckdb_fmt namespace, incompatible with spdlog) Fix: strip conda
@@ -315,6 +319,9 @@ set(EXTENSION_SOURCES
     src/op/scan/lance/lance_split_producer.cpp
     src/lance_shim/lance_ffi_api.cpp
     src/lance_shim/lance_table_function.cpp
+    # src/lance_shim/lance_embedded_ffi.cpp is appended below, only when
+    # SIRIUS_ENABLE_LANCE_KNN is ON: it is the sole translation unit that
+    # references the Rust staticlib.
     src/op/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
@@ -401,6 +408,13 @@ set(EXTENSION_SOURCES
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
 # cmake-format: on
+
+# The only translation unit that references the Rust staticlib. Kept out of the
+# unconditional list so a default build neither needs a Rust toolchain nor
+# carries the ~250 MiB the crate adds to the extension.
+if(SIRIUS_ENABLE_LANCE_KNN)
+  list(APPEND EXTENSION_SOURCES src/lance_shim/lance_embedded_ffi.cpp)
+endif()
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 
@@ -515,6 +529,13 @@ foreach(_target sirius_extension sirius_loadable_extension)
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
+  # SIRIUS_HAVE_LANCE_KNN is what the code tests; the option only says whether
+  # to build it. Keeping them distinct means a translation unit can be compiled
+  # without the option leaking into unrelated headers.
+  if(SIRIUS_ENABLE_LANCE_KNN)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_HAVE_LANCE_KNN)
+  endif()
+
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
   # (cuCascade::cucascade) and cudf::cudf.
@@ -530,6 +551,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
     yaml-cpp::yaml-cpp
     telemetry_bridge
     simpatico)
+
+  if(SIRIUS_ENABLE_LANCE_KNN)
+    target_link_libraries(${_target} sirius_lance_ffi)
+  endif()
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -592,6 +617,18 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# sirius_extension links sirius_lance_ffi, so the export set has to cover it too
+# or the install step fails -- and it fails only there, long after a green
+# build. Separate install() because the target exists only in this
+# configuration.
+if(SIRIUS_ENABLE_LANCE_KNN)
+  install(
+    TARGETS sirius_lance_ffi
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+endif()
 
 if(ENABLE_STREAM_CHECK)
   message(

@@ -22,6 +22,14 @@
 
 namespace sirius::lance {
 
+#ifdef SIRIUS_HAVE_LANCE_KNN
+/// Defined by lance_embedded_ffi.cpp, the gated translation unit that wraps the
+/// pinned Rust staticlib. Declared at namespace scope on purpose: inside the
+/// anonymous namespace below it would have internal linkage and could never
+/// resolve to that definition.
+std::shared_ptr<lance_ffi_api> make_embedded_lance_ffi_api();
+#endif
+
 namespace {
 
 std::mutex& factory_mutex()
@@ -37,11 +45,6 @@ lance_ffi_api_factory& active_factory()
   static lance_ffi_api_factory factory;
   return factory;
 }
-
-#ifdef SIRIUS_HAVE_LANCE_KNN
-/// Provided by the gated translation unit that wraps the pinned Rust staticlib.
-std::shared_ptr<lance_ffi_api> make_embedded_lance_ffi_api();
-#endif
 
 std::shared_ptr<lance_ffi_api> make_default_api()
 {
