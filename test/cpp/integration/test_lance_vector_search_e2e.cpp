@@ -25,6 +25,7 @@
 #include <duckdb/common/exception.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/function/table_function.hpp>
+#include <duckdb/main/appender.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
@@ -34,6 +35,7 @@
 #include <planner/sirius_physical_plan_generator.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -42,6 +44,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -217,6 +220,85 @@ void write_docs_parquet(fs::path const& path)
     path.string() + "' (FORMAT PARQUET)");
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
+}
+
+constexpr std::size_t kAc5Rows = 2000;
+constexpr std::size_t kAc5Dim  = 8;
+constexpr std::size_t kAc5K    = 10;
+constexpr float kAc5QueryValue = 0.50025F;
+
+char const* kAc5QueryVectorSql =
+  "[0.50025, 0.50025, 0.50025, 0.50025, "
+  "0.50025, 0.50025, 0.50025, 0.50025]::FLOAT[]";
+
+std::string ac5_lance_call(fs::path const& dataset,
+                           std::size_t k,
+                           bool use_index,
+                           std::string extra_options = {})
+{
+  return "sirius_lance_vector_search('" + dataset.string() + "', 'vec', " + kAc5QueryVectorSql +
+         ", k := " + std::to_string(k) + ", use_index := " + (use_index ? "true" : "false") +
+         std::move(extra_options) + ")";
+}
+
+void write_ac5_lance_fixture(fs::path const& dataset)
+{
+  setenv("SIRIUS_DISABLE", "1", 1);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection writer(db);
+
+  auto require_writer_ok = [](auto const& result) {
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  };
+
+  auto loaded = writer.Query("LOAD lance");
+  require_writer_ok(loaded);
+
+  auto copied = writer.Query(
+    "COPY (SELECT i::BIGINT AS doc_id, (i % 7)::INTEGER AS cat, "
+    "(i::DOUBLE / 1000.0) AS score, "
+    "list_transform(range(8), lambda x: (i::FLOAT / 1000.0))::FLOAT[8] AS vec "
+    "FROM range(2000) t(i)) TO '" +
+    dataset.string() + "' (FORMAT lance, mode 'overwrite')");
+  require_writer_ok(copied);
+
+  auto indexed = writer.Query("CREATE INDEX vec_idx ON '" + dataset.string() +
+                              "' (vec) USING IVF_PQ WITH "
+                              "(num_partitions=8, num_sub_vectors=4, metric_type='l2')");
+  require_writer_ok(indexed);
+
+  auto indexes = writer.Query("SHOW INDEXES ON '" + dataset.string() + "'");
+  require_writer_ok(indexes);
+  REQUIRE(indexes->RowCount() == 1);
+  CHECK(indexes->GetValue(0, 0).ToString() == "vec_idx");
+  CHECK(indexes->GetValue(1, 0).ToString() == "IVF_PQ");
+  CHECK(indexes->GetValue(3, 0).GetValue<std::uint64_t>() == kAc5Rows);
+}
+
+struct expected_neighbor {
+  std::int64_t doc_id;
+  double distance;
+};
+
+std::vector<expected_neighbor> ac5_exact_oracle()
+{
+  std::vector<expected_neighbor> result;
+  result.reserve(kAc5Rows);
+  for (std::size_t i = 0; i < kAc5Rows; ++i) {
+    auto const value = static_cast<float>(i) / 1000.0F;
+    auto const delta = value - kAc5QueryValue;
+    result.push_back(
+      {static_cast<std::int64_t>(i),
+       static_cast<double>(kAc5Dim) * static_cast<double>(delta) * static_cast<double>(delta)});
+  }
+  std::sort(result.begin(), result.end(), [](auto const& left, auto const& right) {
+    if (left.distance != right.distance) { return left.distance < right.distance; }
+    return left.doc_id < right.doc_id;
+  });
+  result.resize(kAc5K);
+  return result;
 }
 
 struct copy_failure_state {
@@ -722,4 +804,138 @@ TEST_CASE_METHOD(lance_sql_fixture,
     sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0, 0);
     CHECK(state->cpu_calls.load() == 0);
   }
+}
+
+TEST_CASE_METHOD(lance_sql_fixture,
+                 "Lance real FFI relational tail matches a materialized CPU oracle",
+                 "[lance][integration][real_ffi][oracle][relational]")
+{
+  temp_directory tmp("sirius-lance-ac5-relational");
+  auto dataset = tmp.path() / "oracle.lance";
+  write_ac5_lance_fixture(dataset);
+
+  auto source   = ac5_lance_call(dataset, 70, false);
+  auto snapshot = con->Query("SELECT doc_id, cat, score, _distance FROM " + source);
+  REQUIRE(snapshot);
+  if (snapshot->HasError()) { UNSCOPED_INFO(snapshot->GetError()); }
+  REQUIRE_FALSE(snapshot->HasError());
+  REQUIRE(snapshot->RowCount() == 70);
+
+  require_ok("SET gpu_execution = false");
+  require_ok(
+    "CREATE TEMP TABLE knn_snapshot("
+    "doc_id BIGINT, cat INTEGER, score DOUBLE, _distance FLOAT)");
+  {
+    duckdb::Appender appender(*con, "knn_snapshot");
+    for (std::size_t row = 0; row < snapshot->RowCount(); ++row) {
+      appender.BeginRow();
+      appender.Append<std::int64_t>(snapshot->GetValue(0, row).GetValue<std::int64_t>());
+      appender.Append<std::int32_t>(snapshot->GetValue(1, row).GetValue<std::int32_t>());
+      appender.Append<double>(snapshot->GetValue(2, row).GetValue<double>());
+      appender.Append<float>(snapshot->GetValue(3, row).GetValue<float>());
+      appender.EndRow();
+    }
+    appender.Close();
+  }
+  require_ok("SET gpu_execution = true");
+
+  auto relational_sql =
+    "SELECT cat, count(*) AS n, avg(score) AS avg_score, avg(_distance) AS avg_distance FROM " +
+    source +
+    " WHERE score >= 0.48 AND score < 0.53 "
+    "GROUP BY cat ORDER BY cat";
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto gpu    = con->Query(relational_sql);
+  auto after  = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(gpu);
+  if (gpu->HasError()) { UNSCOPED_INFO(gpu->GetError()); }
+  REQUIRE_FALSE(gpu->HasError());
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
+
+  require_ok("SET gpu_execution = false");
+  auto cpu = con->Query(
+    "SELECT cat, count(*) AS n, avg(score) AS avg_score, avg(_distance) AS avg_distance "
+    "FROM knn_snapshot WHERE score >= 0.48 AND score < 0.53 "
+    "GROUP BY cat ORDER BY cat");
+  REQUIRE(cpu);
+  if (cpu->HasError()) { UNSCOPED_INFO(cpu->GetError()); }
+  REQUIRE_FALSE(cpu->HasError());
+
+  REQUIRE(gpu->RowCount() == cpu->RowCount());
+  REQUIRE(gpu->ColumnCount() == cpu->ColumnCount());
+  for (std::size_t row = 0; row < gpu->RowCount(); ++row) {
+    CHECK(gpu->GetValue(0, row).ToString() == cpu->GetValue(0, row).ToString());
+    CHECK(gpu->GetValue(1, row).GetValue<std::int64_t>() ==
+          cpu->GetValue(1, row).GetValue<std::int64_t>());
+    CHECK(gpu->GetValue(2, row).GetValue<double>() ==
+          Approx(cpu->GetValue(2, row).GetValue<double>()).epsilon(1e-6));
+    CHECK(gpu->GetValue(3, row).GetValue<double>() ==
+          Approx(cpu->GetValue(3, row).GetValue<double>()).epsilon(1e-5).margin(1e-9));
+  }
+}
+
+TEST_CASE_METHOD(lance_sql_fixture,
+                 "Lance real FFI exact KNN matches an independent distance oracle",
+                 "[lance][integration][real_ffi][oracle][exact]")
+{
+  temp_directory tmp("sirius-lance-ac5-exact");
+  auto dataset = tmp.path() / "oracle.lance";
+  write_ac5_lance_fixture(dataset);
+
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result =
+    con->Query("SELECT doc_id, _distance FROM " + ac5_lance_call(dataset, kAc5K, false));
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  REQUIRE(result);
+  if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->RowCount() == kAc5K);
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
+
+  auto const expected = ac5_exact_oracle();
+  for (std::size_t row = 0; row < kAc5K; ++row) {
+    CHECK(result->GetValue(0, row).GetValue<std::int64_t>() == expected[row].doc_id);
+    CHECK(result->GetValue(1, row).GetValue<float>() ==
+          Approx(expected[row].distance).epsilon(1e-4).margin(1e-9));
+  }
+}
+
+TEST_CASE_METHOD(lance_sql_fixture,
+                 "Lance real FFI indexed KNN meets recall against exact search",
+                 "[lance][integration][real_ffi][oracle][recall]")
+{
+  temp_directory tmp("sirius-lance-ac5-recall");
+  auto dataset = tmp.path() / "oracle.lance";
+  write_ac5_lance_fixture(dataset);
+
+  auto exact = con->Query("SELECT doc_id FROM " + ac5_lance_call(dataset, kAc5K, false));
+  REQUIRE(exact);
+  if (exact->HasError()) { UNSCOPED_INFO(exact->GetError()); }
+  REQUIRE_FALSE(exact->HasError());
+  REQUIRE(exact->RowCount() == kAc5K);
+
+  auto indexed =
+    con->Query("SELECT doc_id FROM " +
+               ac5_lance_call(dataset, kAc5K, true, ", nprobes := 1, refine_factor := 1"));
+  REQUIRE(indexed);
+  if (indexed->HasError()) { UNSCOPED_INFO(indexed->GetError()); }
+  REQUIRE_FALSE(indexed->HasError());
+  REQUIRE(indexed->RowCount() == kAc5K);
+
+  std::set<std::int64_t> exact_ids;
+  std::set<std::int64_t> indexed_ids;
+  for (std::size_t row = 0; row < kAc5K; ++row) {
+    exact_ids.insert(exact->GetValue(0, row).GetValue<std::int64_t>());
+    indexed_ids.insert(indexed->GetValue(0, row).GetValue<std::int64_t>());
+  }
+  REQUIRE(exact_ids.size() == kAc5K);
+  REQUIRE(indexed_ids.size() == kAc5K);
+
+  std::size_t overlap = 0;
+  for (auto const id : indexed_ids) {
+    if (exact_ids.count(id) != 0) { ++overlap; }
+  }
+  auto const recall = static_cast<double>(overlap) / static_cast<double>(kAc5K);
+  UNSCOPED_INFO("Lance IVF_PQ recall@" << kAc5K << " = " << recall);
+  CHECK(recall >= 0.7);
 }
