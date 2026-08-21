@@ -70,6 +70,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -859,7 +860,9 @@ struct raw_aws_env {
   std::string secret_key;
   std::string session_token;
   std::string bucket;
-  std::string key;
+  std::vector<std::string> keys;
+  bool custom_endpoint{false};
+  bool tls_verify{true};
 };
 
 bool raw_truthy_env(std::string const& name)
@@ -871,35 +874,100 @@ bool raw_truthy_env(std::string const& name)
   return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
+bool raw_bool_env(std::string const& name, bool fallback)
+{
+  auto value = env_or(name);
+  if (value.empty()) { return fallback; }
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (value == "1" || value == "true" || value == "yes" || value == "on") { return true; }
+  if (value == "0" || value == "false" || value == "no" || value == "off") { return false; }
+  throw std::invalid_argument(name + " must be a boolean");
+}
+
+std::vector<std::string> raw_s3_keys()
+{
+  auto const text = env_or("RAW_S3_KEYS");
+  if (text.empty()) {
+    auto key = env_or("RAW_S3_KEY");
+    if (key.empty()) { return {}; }
+    return {std::move(key)};
+  }
+
+  std::vector<std::string> keys;
+  std::size_t start = 0;
+  while (start <= text.size()) {
+    auto const end = text.find(',', start);
+    auto key       = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (key.empty()) {
+      throw std::invalid_argument("RAW_S3_KEYS must contain comma-separated non-empty keys");
+    }
+    if (std::find(keys.begin(), keys.end(), key) != keys.end()) {
+      throw std::invalid_argument("RAW_S3_KEYS must not contain duplicate keys");
+    }
+    keys.push_back(std::move(key));
+    if (end == std::string::npos) { break; }
+    start = end + 1;
+  }
+  return keys;
+}
+
+std::string raw_endpoint_scheme(std::string const& endpoint)
+{
+  auto const separator = endpoint.find("://");
+  if (separator == std::string::npos) { return {}; }
+  auto scheme = endpoint.substr(0, separator);
+  std::transform(scheme.begin(), scheme.end(), scheme.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return scheme;
+}
+
 std::optional<raw_aws_env> read_raw_aws_env()
 {
-  auto unavailable = [](std::string const& message) -> std::optional<raw_aws_env> {
-    if (raw_truthy_env("SIRIUS_TEST_S3_STRICT")) { FAIL(message); }
+  auto const custom_endpoint = raw_truthy_env("RAW_ALLOW_CUSTOM_ENDPOINT");
+  auto unavailable = [custom_endpoint](std::string const& message) -> std::optional<raw_aws_env> {
+    if (custom_endpoint || raw_truthy_env("SIRIUS_TEST_S3_STRICT")) { FAIL(message); }
     SUCCEED(message);
     return std::nullopt;
   };
 
-  raw_aws_env env{env_or("SIRIUS_TEST_S3_ENDPOINT"),
-                  env_or("SIRIUS_TEST_S3_REGION", "us-east-1"),
-                  env_or("SIRIUS_TEST_S3_ACCESS_KEY"),
-                  env_or("SIRIUS_TEST_S3_SECRET_KEY"),
-                  env_or("SIRIUS_TEST_S3_SESSION_TOKEN"),
-                  env_or("SIRIUS_TEST_S3_BUCKET"),
-                  env_or("RAW_S3_KEY")};
+  raw_aws_env env;
+  env.endpoint        = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  env.region          = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  env.access_key      = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
+  env.secret_key      = env_or("SIRIUS_TEST_S3_SECRET_KEY");
+  env.session_token   = env_or("SIRIUS_TEST_S3_SESSION_TOKEN");
+  env.bucket          = env_or("SIRIUS_TEST_S3_BUCKET");
+  env.keys            = raw_s3_keys();
+  env.custom_endpoint = custom_endpoint;
+  env.tls_verify      = custom_endpoint ? raw_bool_env("RAW_TLS_VERIFY", true) : true;
 
   if (env.endpoint.empty() || env.region.empty() || env.access_key.empty() ||
       env.secret_key.empty() || env.bucket.empty()) {
-    return unavailable("SIRIUS_TEST_S3_* real-AWS environment is not complete");
+    return unavailable(custom_endpoint
+                         ? "SIRIUS_TEST_S3_* custom endpoint environment is not complete"
+                         : "SIRIUS_TEST_S3_* real-AWS environment is not complete");
   }
-  if (env.session_token.empty()) {
-    return unavailable(
-      "SIRIUS_TEST_S3_SESSION_TOKEN is required; use assume-role temporary credentials");
+  if (!custom_endpoint) {
+    if (env.session_token.empty()) {
+      return unavailable(
+        "SIRIUS_TEST_S3_SESSION_TOKEN is required; use assume-role temporary credentials");
+    }
+    if (env.endpoint != "https://s3." + env.region + ".amazonaws.com") {
+      return unavailable(
+        "SIRIUS_TEST_S3_ENDPOINT must be regional https://s3.<region>.amazonaws.com");
+    }
+  } else {
+    auto const scheme = raw_endpoint_scheme(env.endpoint);
+    if (scheme != "http" && scheme != "https") {
+      return unavailable("SIRIUS_TEST_S3_ENDPOINT must use http or https");
+    }
   }
-  if (env.endpoint != "https://s3." + env.region + ".amazonaws.com") {
-    return unavailable(
-      "SIRIUS_TEST_S3_ENDPOINT must be regional https://s3.<region>.amazonaws.com");
+  if (env.keys.empty()) {
+    return unavailable("RAW_S3_KEYS or RAW_S3_KEY is required for the raw-transport bench");
   }
-  if (env.key.empty()) { return unavailable("RAW_S3_KEY is required for the raw-transport bench"); }
   return env;
 }
 
@@ -917,28 +985,70 @@ std::size_t raw_size_env(std::string const& name, std::size_t fallback, bool all
   return value;
 }
 
-std::shared_ptr<rest_ioctx> make_raw_aws_ioctx(raw_aws_env const& env,
-                                               std::size_t n_reactors,
-                                               std::size_t max_connections,
-                                               std::size_t range_bytes)
+class raw_counting_authorizer final : public sirius::io::s3::s3_request_authorizer {
+ public:
+  raw_counting_authorizer(std::shared_ptr<sirius::io::s3::s3_request_authorizer> inner,
+                          std::span<std::string const> keys)
+    : _inner(std::move(inner))
+  {
+    for (auto const& key : keys) {
+      _get_counts.emplace(key, std::make_shared<std::atomic<std::uint64_t>>(0));
+    }
+  }
+
+  sirius::io::s3::s3_authorized_request authorize(sirius::io::s3::s3_object_ref const& obj,
+                                                  sirius::io::s3::s3_request_method method,
+                                                  std::chrono::seconds timeout) override
+  {
+    auto request = _inner->authorize(obj, method, timeout);
+    if (method == sirius::io::s3::s3_request_method::GET) {
+      auto const& counts = std::as_const(_get_counts);
+      auto const found   = counts.find(obj.key);
+      if (found != counts.end()) { found->second->fetch_add(1, std::memory_order_relaxed); }
+    }
+    return request;
+  }
+
+  [[nodiscard]] std::uint64_t get_count(std::string const& key) const
+  {
+    auto const found = _get_counts.find(key);
+    return found == _get_counts.end() ? 0 : found->second->load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::shared_ptr<sirius::io::s3::s3_request_authorizer> _inner;
+  std::unordered_map<std::string, std::shared_ptr<std::atomic<std::uint64_t>>> _get_counts;
+};
+
+struct raw_ioctx_bundle {
+  std::shared_ptr<rest_ioctx> ioctx;
+  std::shared_ptr<raw_counting_authorizer> authorizer;
+};
+
+raw_ioctx_bundle make_raw_aws_ioctx(raw_aws_env const& env,
+                                    std::size_t n_reactors,
+                                    std::size_t max_connections,
+                                    std::size_t range_bytes)
 {
   sirius::io::rest::config cfg{};
   cfg.max_connections      = max_connections;
   cfg.chunk_size           = range_bytes;
   cfg.max_n_chunks         = 1;
   cfg.perf_instrumentation = true;
+  cfg.tls_verify           = env.tls_verify;
 
   sirius::io::s3::static_credentials creds;
   creds.access_key_id     = env.access_key;
   creds.secret_access_key = env.secret_key;
   creds.session_token     = env.session_token;
-  auto authorizer         = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
+  auto signer             = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
     std::move(creds), env.region, env.endpoint);
-  auto context = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
-    cfg, std::move(authorizer), nullptr);
+  auto authorizer = std::make_shared<raw_counting_authorizer>(std::move(signer), env.keys);
+  auto context =
+    std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(cfg, authorizer, nullptr);
   auto ioctx = std::make_shared<rest_ioctx>(n_reactors, std::move(context));
   ioctx->start();
-  return ioctx;
+  return {std::move(ioctx), std::move(authorizer)};
 }
 
 std::string raw_json_escape(std::string_view value)
@@ -2518,7 +2628,7 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
   }
 }
 
-TEST_CASE("REST raw S3 transport reads one object through a configurable connection pool",
+TEST_CASE("REST raw S3 transport reads objects through a configurable connection pool",
           "[.][s3][bench][raw-transport][aws][live]")
 {
   auto const env = read_raw_aws_env();
@@ -2534,44 +2644,82 @@ TEST_CASE("REST raw S3 transport reads one object through a configurable connect
   }
   auto const total_slots = n_reactors * max_connections;
 
-  auto ioctx = make_raw_aws_ioctx(*env, n_reactors, max_connections, range_bytes);
-  REQUIRE(ioctx->cache() == nullptr);
-  auto datasource = ioctx->open_datasource("s3://" + env->bucket + "/" + env->key);
-  REQUIRE(datasource != nullptr);
-  auto const object_bytes = datasource->size();
-  REQUIRE(object_bytes > 0);
+  auto bundle = make_raw_aws_ioctx(*env, n_reactors, max_connections, range_bytes);
+  REQUIRE(bundle.ioctx->cache() == nullptr);
 
-  std::vector<std::uint8_t> host_buffer(object_bytes);
-  auto const range_count = 1 + (object_bytes - 1) / range_bytes;
-  INFO("object has " << range_count << " ranges for " << total_slots << " connection slots");
-  REQUIRE(range_count >= total_slots);
+  struct raw_object_work {
+    std::string key;
+    std::unique_ptr<sirius::io::sirius_datasource> datasource;
+    std::size_t object_bytes{0};
+    std::size_t range_count{0};
+    std::vector<std::vector<sirius::io::io_object_segment>> batches;
+    std::size_t reads_completed{0};
+    std::uint64_t logical_get_count{0};
+  };
 
-  std::vector<std::vector<sirius::io::io_object_segment>> batches(n_reactors);
-  for (std::size_t offset = 0, index = 0; offset < object_bytes; offset += range_bytes, ++index) {
-    auto const size = std::min(range_bytes, object_bytes - offset);
-    batches[index % n_reactors].emplace_back(offset, size, host_buffer.data() + offset);
+  std::vector<raw_object_work> objects;
+  objects.reserve(env->keys.size());
+  std::size_t dataset_bytes     = 0;
+  std::size_t max_object_bytes  = 0;
+  std::size_t total_range_count = 0;
+  for (auto const& key : env->keys) {
+    auto datasource = bundle.ioctx->open_datasource("s3://" + env->bucket + "/" + key);
+    REQUIRE(datasource != nullptr);
+    auto const object_bytes = datasource->size();
+    REQUIRE(object_bytes > 0);
+    auto const range_count = 1 + (object_bytes - 1) / range_bytes;
+    if (object_bytes > std::numeric_limits<std::size_t>::max() - dataset_bytes ||
+        range_count > std::numeric_limits<std::size_t>::max() - total_range_count) {
+      throw std::overflow_error("raw-transport dataset size overflow");
+    }
+    dataset_bytes += object_bytes;
+    max_object_bytes = std::max(max_object_bytes, object_bytes);
+    total_range_count += range_count;
+    objects.push_back({key, std::move(datasource), object_bytes, range_count, {}, 0, 0});
   }
 
-  auto read_once = [&] {
+  INFO("dataset has " << total_range_count << " ranges across " << objects.size() << " keys for "
+                      << total_slots << " connection slots");
+  std::vector<std::uint8_t> host_buffer(max_object_bytes);
+  for (auto& object : objects) {
+    INFO(object.key << " has " << object.range_count << " ranges");
+    REQUIRE(object.range_count >= total_slots);
+    object.batches.resize(n_reactors);
+    for (std::size_t offset = 0, index = 0; offset < object.object_bytes;
+         offset += range_bytes, ++index) {
+      auto const size = std::min(range_bytes, object.object_bytes - offset);
+      object.batches[index % n_reactors].emplace_back(offset, size, host_buffer.data() + offset);
+    }
+  }
+
+  auto read_once = [&](raw_object_work& object) {
     std::vector<sirius::exec::semi_future<std::size_t>> futures;
-    futures.reserve(batches.size());
-    // One vector-read call selects one reactor, so submit one batch per reactor.
-    for (auto& batch : batches) {
+    futures.reserve(object.batches.size());
+    for (auto& batch : object.batches) {
       REQUIRE_FALSE(batch.empty());
-      futures.push_back(ioctx->host_read_ranges_async_io(datasource->io_object(), batch));
+      futures.push_back(
+        bundle.ioctx->host_read_ranges_async_io(object.datasource->io_object(), batch));
     }
 
     std::size_t bytes = 0;
     for (auto& future : futures) {
       auto const got = std::move(future).get();
-      REQUIRE(bytes <= object_bytes);
-      REQUIRE(got <= object_bytes - bytes);
+      REQUIRE(bytes <= object.object_bytes);
+      REQUIRE(got <= object.object_bytes - bytes);
       bytes += got;
     }
+    ++object.reads_completed;
+    object.logical_get_count += object.range_count;
     return bytes;
   };
 
-  auto const before = ioctx->perf_snapshot();
+  std::vector<std::uint64_t> initial_get_counts;
+  initial_get_counts.reserve(objects.size());
+  for (auto const& object : objects) {
+    initial_get_counts.push_back(bundle.authorizer->get_count(object.key));
+  }
+
+  auto const before = bundle.ioctx->perf_snapshot();
   REQUIRE(before.chunk_get_count == 0);
   REQUIRE(before.ttfb_ns == 0);
 
@@ -2580,23 +2728,36 @@ TEST_CASE("REST raw S3 transport reads one object through a configurable connect
   auto const start                = std::chrono::steady_clock::now();
   auto const minimum_duration     = std::chrono::duration<double>{static_cast<double>(min_seconds)};
   do {
-    auto const got = read_once();
-    REQUIRE(got == object_bytes);
+    auto& object   = objects[reps_completed % objects.size()];
+    auto const got = read_once(object);
+    REQUIRE(got == object.object_bytes);
     if (got > std::numeric_limits<std::uint64_t>::max() - bytes_transferred) {
       throw std::overflow_error("raw-transport byte counter overflow");
     }
     bytes_transferred += got;
     ++reps_completed;
-  } while (reps_completed < min_reps ||
+  } while (reps_completed < std::max(min_reps, objects.size()) ||
            std::chrono::steady_clock::now() - start < minimum_duration);
   auto const stop  = std::chrono::steady_clock::now();
-  auto const after = ioctx->perf_snapshot();
+  auto const after = bundle.ioctx->perf_snapshot();
 
   auto const elapsed_s = std::chrono::duration<double>(stop - start).count();
   REQUIRE(elapsed_s > 0.0);
-  auto const get_count = after.chunk_get_count - before.chunk_get_count;
-  REQUIRE(reps_completed <= std::numeric_limits<std::size_t>::max() / range_count);
-  REQUIRE(get_count == range_count * reps_completed);
+  auto const get_count            = after.chunk_get_count - before.chunk_get_count;
+  std::uint64_t logical_get_count = 0;
+  std::uint64_t per_key_get_count = 0;
+  for (std::size_t i = 0; i < objects.size(); ++i) {
+    REQUIRE(objects[i].logical_get_count <=
+            std::numeric_limits<std::uint64_t>::max() - logical_get_count);
+    logical_get_count += objects[i].logical_get_count;
+    auto const current = bundle.authorizer->get_count(objects[i].key);
+    REQUIRE(current >= initial_get_counts[i]);
+    auto const delta = current - initial_get_counts[i];
+    REQUIRE(delta <= std::numeric_limits<std::uint64_t>::max() - per_key_get_count);
+    per_key_get_count += delta;
+  }
+  REQUIRE(get_count >= logical_get_count);
+  CHECK(per_key_get_count == get_count);
   auto const payload_bytes = after.payload_bytes_read_total - before.payload_bytes_read_total;
   CHECK(payload_bytes >= bytes_transferred);
   CHECK(after.terminal_failures_total == before.terminal_failures_total);
@@ -2605,20 +2766,26 @@ TEST_CASE("REST raw S3 transport reads one object through a configurable connect
 
   auto const effective_gbps =
     static_cast<double>(bytes_transferred) * 8.0 / elapsed_s / 1'000'000'000.0;
+  auto const effective_gbytes_per_sec =
+    static_cast<double>(bytes_transferred) / elapsed_s / 1'000'000'000.0;
   auto const avg_bytes_per_get =
     static_cast<double>(bytes_transferred) / static_cast<double>(get_count);
+  auto const scheme = raw_endpoint_scheme(env->endpoint);
 
   std::ostringstream json;
   json << std::fixed << std::setprecision(6) << "{\"git_sha\":\""
        << raw_json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\"host\":\""
-       << raw_json_escape(env_or("HOSTNAME", "unknown")) << "\",\"backend\":\"rest_aws_raw\","
-       << "\"bucket\":\"" << raw_json_escape(env->bucket) << "\",\"key\":\""
-       << raw_json_escape(env->key) << "\",\"object_bytes\":" << object_bytes
+       << raw_json_escape(env_or("HOSTNAME", "unknown")) << "\",\"backend\":\""
+       << (env->custom_endpoint ? "rest_custom_raw" : "rest_aws_raw") << "\",\"scheme\":\""
+       << raw_json_escape(scheme) << "\",\"bucket\":\"" << raw_json_escape(env->bucket)
+       << "\",\"key_count\":" << objects.size() << ",\"dataset_bytes\":" << dataset_bytes
        << ",\"range_bytes\":" << range_bytes << ",\"rest_n_reactors\":" << n_reactors
        << ",\"connections_per_reactor\":" << max_connections << ",\"total_slots\":" << total_slots
        << ",\"elapsed_s\":" << elapsed_s << ",\"reps_completed\":" << reps_completed
-       << ",\"bytes_transferred\":" << bytes_transferred << ",\"effective_gbps\":" << effective_gbps
-       << ",\"get_count\":" << get_count << ",\"avg_bytes_per_get\":" << avg_bytes_per_get
+       << ",\"bytes_transferred\":" << bytes_transferred
+       << ",\"effective_gbytes_per_sec\":" << effective_gbytes_per_sec
+       << ",\"effective_gbps\":" << effective_gbps << ",\"get_count\":" << get_count
+       << ",\"avg_bytes_per_get\":" << avg_bytes_per_get
        << ",\"chunk_get_ns_total\":" << after.chunk_get_ns_total - before.chunk_get_ns_total
        << ",\"chunk_get_ns_max\":" << after.chunk_get_ns_max
        << ",\"queue_wait_ns_total\":" << after.queue_wait_ns_total - before.queue_wait_ns_total
@@ -2637,7 +2804,28 @@ TEST_CASE("REST raw S3 transport reads one object through a configurable connect
        << ",\"h2d_observed_count\":" << after.h2d_observed_count - before.h2d_observed_count
        << ",\"h2d_observed_ns_max\":" << after.h2d_observed_ns_max
        << ",\"device_stream_sync_total\":"
-       << after.device_stream_sync_total - before.device_stream_sync_total << "}";
+       << after.device_stream_sync_total - before.device_stream_sync_total
+       << ",\"config_signature\":{\"endpoint\":\"" << raw_json_escape(env->endpoint)
+       << "\",\"scheme\":\"" << raw_json_escape(scheme) << "\",\"bucket\":\""
+       << raw_json_escape(env->bucket) << "\",\"keys\":[";
+  for (std::size_t i = 0; i < objects.size(); ++i) {
+    if (i != 0) { json << ','; }
+    json << '"' << raw_json_escape(objects[i].key) << '"';
+  }
+  json << "],\"range_bytes\":" << range_bytes << ",\"rest_n_reactors\":" << n_reactors
+       << ",\"connections_per_reactor\":" << max_connections << ",\"total_slots\":" << total_slots
+       << ",\"tls_verify\":" << (env->tls_verify ? "true" : "false") << "},\"per_key\":[";
+  for (std::size_t i = 0; i < objects.size(); ++i) {
+    if (i != 0) { json << ','; }
+    auto const get_delta = bundle.authorizer->get_count(objects[i].key) - initial_get_counts[i];
+    json << "{\"key\":\"" << raw_json_escape(objects[i].key)
+         << "\",\"object_bytes\":" << objects[i].object_bytes
+         << ",\"range_count\":" << objects[i].range_count
+         << ",\"reads_completed\":" << objects[i].reads_completed
+         << ",\"logical_get_count\":" << objects[i].logical_get_count
+         << ",\"get_count\":" << get_delta << '}';
+  }
+  json << "]}";
 
   auto const output_path = raw_transport_json_path();
   std::filesystem::create_directories(output_path.parent_path());

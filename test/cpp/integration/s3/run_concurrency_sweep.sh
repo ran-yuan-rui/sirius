@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Manual real-AWS sweep. P is the total slot count, R is the reactor count, and
 # C=P/R is passed as max_connections. Export temporary SIRIUS_TEST_S3_* credentials,
-# then set SWEEP_MODE, SWEEP_P, SWEEP_R, and RAW_S3_KEY as needed.
+# then set SWEEP_MODE, SWEEP_P, SWEEP_R, and RAW_S3_KEYS or RAW_S3_KEY as needed.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIRIUS_PROJECT_ROOT="${SIRIUS_PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
@@ -83,11 +83,16 @@ command -v python3 >/dev/null || fail "python3 is required to merge benchmark JS
 command -v ip >/dev/null || fail "ip is required to discover the benchmark interface"
 
 for name in SIRIUS_TEST_S3_ENDPOINT SIRIUS_TEST_S3_REGION SIRIUS_TEST_S3_ACCESS_KEY \
-  SIRIUS_TEST_S3_SECRET_KEY SIRIUS_TEST_S3_SESSION_TOKEN SIRIUS_TEST_S3_BUCKET; do
+  SIRIUS_TEST_S3_SECRET_KEY SIRIUS_TEST_S3_BUCKET; do
   require_env "$name"
 done
+case "${RAW_ALLOW_CUSTOM_ENDPOINT:-0}" in
+  1 | true | TRUE | yes | YES | on | ON) ;;
+  *) require_env SIRIUS_TEST_S3_SESSION_TOKEN ;;
+esac
 if [[ "$SWEEP_MODE" == raw || "$SWEEP_MODE" == both ]]; then
-  require_env RAW_S3_KEY
+  [[ -n "${RAW_S3_KEYS:-}" || -n "${RAW_S3_KEY:-}" ]] ||
+    fail "RAW_S3_KEYS or RAW_S3_KEY is required"
 fi
 
 positive_integer SWEEP_IDLE_SECONDS "$SWEEP_IDLE_SECONDS"
@@ -336,6 +341,9 @@ record = {
     "C": integer("POINT_C"),
     "parameters": {
         "raw_key": os.environ.get("RAW_S3_KEY") or None,
+        "raw_keys": os.environ.get("RAW_S3_KEYS") or None,
+        "raw_allow_custom_endpoint": os.environ.get("RAW_ALLOW_CUSTOM_ENDPOINT") or None,
+        "raw_tls_verify": os.environ.get("RAW_TLS_VERIFY") or None,
         "sql_key": os.environ.get("SIRIUS_BENCH_S3_KEY") or None,
         "raw_range_bytes": integer("RAW_RANGE_BYTES"),
         "raw_min_seconds": integer("SWEEP_MIN_SECONDS"),
